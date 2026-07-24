@@ -21,6 +21,23 @@ const cors = require('cors');
 
 const RATE_LIMIT_DISABLED = process.env.RATE_LIMIT_DISABLED === '1';
 
+// Rate limiting is ON unless NODE_ENV explicitly names a dev/test box.
+// Fail-closed on purpose: an UNSET NODE_ENV (the default on a Render service
+// created by hand rather than from render.yaml) must never silently disable
+// the limiter in production.
+const RATE_LIMIT_BYPASS_ENV = ['development', 'test'].includes(
+  process.env.NODE_ENV,
+);
+
+// The admin console fans out a dozen parallel requests on every page load and
+// would burn a per-IP budget in a single view, so it is exempt. Matched on
+// req.path — NOT originalUrl — so a `?x=/admin` query string on an unrelated
+// endpoint can't be used to skip the limiter. Covers both mount points the
+// admin router is bound to in server.js (`/admin` and `/api/admin`).
+const ADMIN_PREFIXES = ['/admin', '/api/admin'];
+const isAdminPath = (req) =>
+  ADMIN_PREFIXES.some((p) => req.path === p || req.path.startsWith(`${p}/`));
+
 // ── 1. Rate limiters ────────────────────────────────────────────────────
 
 // A limiter that no-ops when RATE_LIMIT_DISABLED=1 (local load testing),
@@ -35,18 +52,24 @@ function buildLimiter(opts) {
   });
 }
 
-// Global limiter — 200 requests / 15 min / IP. Blanket protection against
-// scraping and brute abuse across the whole API surface. Health checks and
-// static uploads are skipped so probes/CDN don't burn a caller's budget.
+// Global limiter — 1000 requests / 15 min / IP by default. Sized so an admin
+// dashboard load or a chatty mobile session can't trip it, while still
+// blunting scrapers and brute abuse across the whole API surface. Health
+// checks and static uploads are skipped so probes/CDN don't burn a caller's
+// budget; admin routes and dev/test environments are skipped entirely.
+// RATE_LIMIT_MAX retunes the cap from the dashboard without a code deploy.
 const globalLimiter = buildLimiter({
   windowMs: 15 * 60 * 1000,
-  max: 200,
+  max: Number(process.env.RATE_LIMIT_MAX || 1000),
   message: {
     success: false,
     message: 'Too many requests — please slow down and try again shortly.',
   },
   skip: (req) =>
-    req.path === '/health' || req.path.startsWith('/uploads'),
+    req.path === '/health' ||
+    req.path.startsWith('/uploads') ||
+    isAdminPath(req) ||
+    RATE_LIMIT_BYPASS_ENV,
 });
 
 // Auth/OTP limiter — 5 attempts / 15 min / IP. Mounted specifically on the
@@ -59,6 +82,10 @@ const authLimiter = buildLimiter({
   // burn the budget, so a legitimate user isn't locked out by their own
   // successful sign-ins.
   skipSuccessfulRequests: true,
+  // Dev/test only — never relaxed in production. The 5-attempt cap is only
+  // safe because `trust proxy` (below) makes this key on the real client IP;
+  // untrusted, five failed logins from anyone would lock out everyone.
+  skip: () => RATE_LIMIT_BYPASS_ENV,
   message: {
     success: false,
     message:
@@ -166,10 +193,18 @@ function buildMongoSanitize() {
  * parsers/routes so headers and rate limits cover everything.
  */
 function applySecurity(app) {
-  // Behind a proxy/load balancer, trust exactly N hops so req.ip is the real
-  // client and the rate limiter can't be bypassed by spoofing X-Forwarded-For.
-  const hops = Number(process.env.TRUST_PROXY_HOPS || 0);
-  if (hops > 0) app.set('trust proxy', hops);
+  // Render (like every PaaS) terminates TLS at exactly ONE proxy hop in front
+  // of the app. Without this, req.ip is the proxy's address, every caller
+  // shares a single rate-limit bucket, and the whole user base gets 429'd at
+  // once. Default to 1 hop so a service created by hand in the dashboard —
+  // with no TRUST_PROXY_HOPS var set — is still correct out of the box.
+  // Set TRUST_PROXY_HOPS=0 when running with NO proxy in front (bare VPS),
+  // where trusting X-Forwarded-For would let a client spoof its own IP.
+  // `??` not `||`: an explicit 0 must survive. A hop *count* (rather than
+  // `true`) also keeps express-rate-limit's permissive-trust-proxy validator
+  // satisfied.
+  const hops = Number(process.env.TRUST_PROXY_HOPS ?? 1);
+  app.set('trust proxy', Number.isFinite(hops) ? hops : 1);
 
   app.disable('x-powered-by');
   app.use(buildHelmet());

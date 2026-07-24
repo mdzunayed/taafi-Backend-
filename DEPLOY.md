@@ -82,7 +82,8 @@ secrets belong in Render's dashboard instead.
 > Prefer clicking through by hand instead of a blueprint? **New → Web
 > Service**, runtime **Node**, build `npm ci --omit=dev`, start `npm start`,
 > health check path `/health`, then add every variable from `render.yaml`
-> manually — including `PUPPETEER_SKIP_DOWNLOAD=1` and `TRUST_PROXY_HOPS=1`.
+> manually — including `PUPPETEER_SKIP_DOWNLOAD=1` and `NODE_ENV=production`.
+> (`TRUST_PROXY_HOPS` now defaults to 1 in code, so it is optional.)
 
 ## 5. Set `PUBLIC_BASE_URL` and verify
 
@@ -162,9 +163,13 @@ Clear build cache & deploy**.
 **`[mongo] connection error: ... ENOTFOUND`** — the SRV hostname is wrong, or
 Atlas Network Access is not open to `0.0.0.0/0`.
 
-**Everyone gets rate-limited at once** — `TRUST_PROXY_HOPS=1` is missing, so
-`express-rate-limit` is keying every request to Render's proxy IP and
-treating all users as one client.
+**Everyone gets rate-limited at once** — `express-rate-limit` is keying every
+request to Render's proxy IP and treating all users as one client. The code now
+defaults `trust proxy` to **1 hop**, so this should not happen; if it does,
+check that `TRUST_PROXY_HOPS` has not been explicitly set to `0` in the
+Environment tab. Legitimate traffic hitting the cap is a different problem —
+raise `RATE_LIMIT_MAX` (default 1000 per IP per 15 min). Admin routes
+(`/admin/*`, `/api/admin/*`) are exempt from the global limiter entirely.
 
 **Uploaded images 404 after a redeploy** — `CLOUDINARY_URL` is unset, so
 uploads went to the ephemeral disk. Set it; note that images uploaded before
