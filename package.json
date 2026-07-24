@@ -1,0 +1,38 @@
+{
+  "name": "taafi-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Taafi REST API (Express + Mongoose + Multer)",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "worker": "node src/queues/worker.js",
+    "loadtest": "node tests/load_test.js",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "bullmq": "^5.34.0",
+    "cloudinary": "^2.10.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-mongo-sanitize": "^2.2.0",
+    "express-rate-limit": "^7.4.1",
+    "firebase-admin": "^13.10.0",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^8.5.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "puppeteer": "^23.11.1",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "autocannon": "^7.15.0",
+    "nodemon": "^3.1.0"
+  }
+}
