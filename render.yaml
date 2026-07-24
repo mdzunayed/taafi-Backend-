@@ -1,0 +1,57 @@
+# Render blueprint — free-tier Node web service for the Taafi API.
+#
+# Usage: Render Dashboard → New → Blueprint → point at this repo. Render
+# reads this file and provisions the service. Secrets marked `sync: false`
+# are NOT stored here; Render prompts for them once at create time.
+#
+# Free tier caveats worth knowing before you ship an APK against this:
+#   • The instance SLEEPS after 15 min with no traffic. The next request
+#     cold-starts it (~30-60s). See the keep-alive note in DEPLOY.md.
+#   • Disk is EPHEMERAL — anything written to ./uploads vanishes on every
+#     restart/redeploy. Cloudinary env vars are therefore required, not
+#     optional (middleware/upload.js falls back to local disk without them).
+#   • 512MB RAM. Puppeteer/Chromium is skipped at install; the prescription
+#     PDF download endpoint returns 503 until you move to a paid/Docker plan.
+
+services:
+  - type: web
+    name: taafi-api
+    runtime: node
+    plan: free
+    region: singapore # closest Render region to Bangladesh
+    branch: main
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Skip the ~170MB Chromium download — it blows past the free build
+      # limits and can't run without system libs anyway.
+      - key: PUPPETEER_SKIP_DOWNLOAD
+        value: "1"
+      # Render terminates TLS at exactly one proxy hop in front of the app.
+      # Without this, express-rate-limit keys every request to the proxy's
+      # IP and one abusive client rate-limits the entire user base.
+      - key: TRUST_PROXY_HOPS
+        value: "1"
+      # Run the BullMQ worker in-process — a separate worker dyno costs money.
+      - key: QUEUE_INLINE_WORKER
+        value: "1"
+      # ── Secrets: entered once in the Render dashboard, never committed ──
+      - key: MONGO_URI # MongoDB Atlas M0 free cluster SRV string
+        sync: false
+      - key: JWT_SECRET # openssl rand -hex 32
+        sync: false
+      - key: CLOUDINARY_URL # cloudinary://<key>:<secret>@<cloud_name>
+        sync: false
+      # Public origin of THIS service, e.g. https://taafi-api.onrender.com
+      # Used to build absolute /uploads URLs. Set after the first deploy,
+      # once Render has assigned the hostname.
+      - key: PUBLIC_BASE_URL
+        sync: false
+      # Comma-separated browser origins for the web admin console. Native
+      # Flutter/APK clients send no Origin header and are always allowed,
+      # so this can stay unset if you only ship the mobile app.
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false

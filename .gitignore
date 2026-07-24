@@ -4,3 +4,7 @@ uploads/*
 !uploads/.gitkeep
 npm-debug.log
 .DS_Store
+
+# Local scratch scripts (never deploy)
+_*_tmp.js
+_cdp_tmp.js

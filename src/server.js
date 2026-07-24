@@ -143,7 +143,10 @@ app.use((err, _req, res, _next) => {
   res.status(err.status || 500).json({ message: err.message || 'Server error' });
 });
 
-const PORT = Number(process.env.PORT || 4000);
+// Render (and every other PaaS) injects the port to bind on via $PORT — it
+// is NOT negotiable, so this must never be hard-coded in production. 5000 is
+// only the local-dev fallback.
+const PORT = Number(process.env.PORT || 5000);
 // Matches the database the team actually populates via Compass / Docker
 // (collections: accounts, care_requests, providers). Override with the
 // MONGO_URI env var for staging / prod.
@@ -711,13 +714,12 @@ mongoose
       });
     });
 
-    // server.listen(PORT, () =>
-    //   console.log(`[api] listening on http://localhost:${PORT}`)
-    // );
-
-    const PORT = process.env.PORT || 5000;
-    server.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
+    // Bind 0.0.0.0 (not the default localhost-ish resolution) so the
+    // platform's health checker and router can reach the process from
+    // outside the container. Render marks a deploy "live" only once it
+    // detects a listener on $PORT at 0.0.0.0.
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`[api] listening on 0.0.0.0:${PORT}`);
     });
     // Friendly diagnostic when something else is already holding the
     // port. The default Node trace dump leads people to think Express

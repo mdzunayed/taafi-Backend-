@@ -5,8 +5,28 @@
 // the two layouts in sync when either changes) and compiles it to a PDF
 // buffer with puppeteer. Consumed by GET /api/prescriptions/:id/download.
 
-const puppeteer = require('puppeteer');
 const { loadProviderPair, buildDoctorView } = require('./doctorView');
+
+// puppeteer is resolved LAZILY (inside getBrowser) rather than at module
+// load. On slim PaaS runtimes — Render's free native Node environment in
+// particular — the ~170MB bundled Chromium is commonly skipped at install
+// time (PUPPETEER_SKIP_DOWNLOAD=1) to stay inside the build limits. A
+// top-level require there would throw during boot and take down the ENTIRE
+// API over one optional endpoint. Deferring it means the server starts
+// clean and only GET /api/prescriptions/:id/download degrades.
+function loadPuppeteer() {
+  try {
+    return require('puppeteer');
+  } catch (_err) {
+    const e = new Error(
+      'PDF rendering is unavailable on this deployment (puppeteer/Chromium ' +
+        'is not installed). Set PUPPETEER_EXECUTABLE_PATH to a system ' +
+        'Chromium, or deploy the Docker image which bundles one.',
+    );
+    e.status = 503;
+    throw e;
+  }
+}
 
 // ── Pad palette — mirrors the Dart `_pad*` constants in
 //    prescription_pad_widget.dart. Update both together.
@@ -33,9 +53,18 @@ async function getBrowser() {
     if (existing && existing.connected) return existing;
     browserPromise = null;
   }
+  const puppeteer = loadPuppeteer();
   browserPromise = puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    // --disable-dev-shm-usage (containers give /dev/shm only 64MB) and
+    // --disable-gpu keep Chromium inside a 512MB memory ceiling; without
+    // them it OOM-kills the instance on small plans.
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+    ],
     ...(process.env.PUPPETEER_EXECUTABLE_PATH
       ? { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH }
       : {}),
