@@ -43,6 +43,8 @@ const CareRequest = require('./models/CareRequest');
 const { isBookingChatOpen } = require('./utils/bookingFlow');
 const { normalizePhone } = require('./utils/phone');
 const { UPLOAD_DIR } = require('./middleware/upload');
+// Magic-byte Content-Type detection for the /uploads static mount.
+const { sniffImageMime } = require('./utils/imageMime');
 // Production security stack (helmet + CORS allow-list + rate limiting) and
 // the NoSQL-injection sanitizer.
 const security = require('./middleware/security');
@@ -68,7 +70,42 @@ app.use(express.urlencoded({ extended: true }));
 app.use(security.mongoSanitize);
 app.use(morgan('dev'));
 
-app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '7d' }));
+// ── Uploaded images (/uploads) ────────────────────────────────────────────
+// Uploaded assets are public by definition — they're rendered by the mobile
+// app, the web admin console, and any future surface. The global CORS
+// allow-list (middleware/security.js) is the right policy for the JSON API but
+// too narrow here, so widen it to `*` for this mount only.
+//
+// The removeHeader is load-bearing, not tidying: the global cors() runs with
+// `credentials: true`, and a browser REJECTS a response that carries
+// `Access-Control-Allow-Origin: *` together with
+// `Access-Control-Allow-Credentials: true`. Overwriting ACAO without dropping
+// ACAC would break every image it was meant to fix.
+function uploadsCors(_req, res, next) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.removeHeader('Access-Control-Allow-Credentials');
+  // Helmet already sets this globally; repeated here so the mount stays
+  // correct if the helmet policy is ever tightened back to same-origin.
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  next();
+}
+
+app.use(
+  '/uploads',
+  uploadsCors,
+  express.static(UPLOAD_DIR, {
+    maxAge: '7d',
+    setHeaders(res, filePath, stat) {
+      // writeImageToDisk names EVERY upload `.jpg` even when the bytes are
+      // PNG or WebP, so the extension-derived Content-Type is frequently a
+      // lie — and Flutter Web's strict ImageDecoder throws
+      // "EncodingError: The source image cannot be decoded" on the mismatch.
+      // Declare what the bytes actually are. See utils/imageMime.js.
+      const mime = sniffImageMime(filePath, stat);
+      if (mime) res.setHeader('Content-Type', mime);
+    },
+  }),
+);
 
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
