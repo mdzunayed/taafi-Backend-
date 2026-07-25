@@ -3,15 +3,13 @@ const AppOpenAd = require('../models/AppOpenAd');
 const { upload, storeImage, removeImage } = require('../middleware/upload');
 const { requireRole } = require('../middleware/auth');
 
-const router = express.Router();
+const { toAbsolute } = require('../utils/publicUrl');
 
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'http://localhost:4000';
+const router = express.Router();
 
 function decorate(doc) {
   const obj = doc.toJSON();
-  if (obj.imageUrl && !/^https?:\/\//i.test(obj.imageUrl)) {
-    obj.imageUrl = `${PUBLIC_BASE_URL}/uploads/${obj.imageUrl}`;
-  }
+  obj.imageUrl = toAbsolute(obj.imageUrl);
   return obj;
 }
 

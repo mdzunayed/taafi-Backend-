@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const PromoBanner = require('../models/PromoBanner');
 const {
   upload,
@@ -9,22 +10,18 @@ const { requireRole } = require('../middleware/auth');
 // Redis read-cache: public GET cached 5 min; every admin write purges it.
 const { cache, invalidateOnSuccess } = require('../services/cacheService');
 
-const router = express.Router();
+const { toAbsolute } = require('../utils/publicUrl');
 
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'http://localhost:4000';
-const imageUrl = (filename) => filename ? `${PUBLIC_BASE_URL}/uploads/${filename}` : null;
+const router = express.Router();
 
 function decorate(doc) {
   const obj = doc.toJSON();
-  if (obj.imageUrl && !/^https?:\/\//i.test(obj.imageUrl)) {
-    obj.imageUrl = imageUrl(obj.imageUrl);
-  }
+  obj.imageUrl = toAbsolute(obj.imageUrl);
   // The populated target service goes through its own toJSON (id/title/
   // price/category/imageUrl) but not services.js's own `decorate`, so its
   // imageUrl still needs the same bare-filename -> absolute-URL resolution.
-  if (obj.targetServiceId && obj.targetServiceId.imageUrl &&
-      !/^https?:\/\//i.test(obj.targetServiceId.imageUrl)) {
-    obj.targetServiceId.imageUrl = imageUrl(obj.targetServiceId.imageUrl);
+  if (obj.targetServiceId && obj.targetServiceId.imageUrl) {
+    obj.targetServiceId.imageUrl = toAbsolute(obj.targetServiceId.imageUrl);
   }
   return obj;
 }
@@ -116,7 +113,19 @@ router.post('/', requireRole('admin'), invalidateOnSuccess('banners'), upload.si
 
     const gradientColors = parseGradient(req.body.gradientColors);
 
+    // Store the image BEFORE creating the row: creating first meant a
+    // storeImage failure left a phantom image-less banner behind, which then
+    // showed up in the admin list on the next GET even though the request
+    // returned 500. The _id is only needed as a stable publicId for the
+    // upload, so mint it up front rather than letting Mongo assign it.
+    const _id = new mongoose.Types.ObjectId();
+    const imageUrl = req.file
+      ? await storeImage(req.file.buffer, _id.toString())
+      : undefined;
+
     const doc = await PromoBanner.create({
+      _id,
+      ...(imageUrl ? { imageUrl } : {}),
       tagText: tagText.trim(),
       title: title.trim(),
       buttonText: buttonText.trim(),
@@ -125,11 +134,6 @@ router.post('/', requireRole('admin'), invalidateOnSuccess('banners'), upload.si
       isActive: parseBool(req.body.isActive, true),
       ...pickActionFields(req.body),
     });
-
-    if (req.file) {
-      doc.imageUrl = await storeImage(req.file.buffer, doc._id.toString());
-      await doc.save();
-    }
 
     await doc.populate(TARGET_SERVICE_POPULATE);
     res.status(201).json(decorate(doc));

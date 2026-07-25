@@ -9,13 +9,19 @@ const {
 } = require('../middleware/upload');
 const { requireRole } = require('../middleware/auth');
 
-const router = express.Router();
+const { toAbsolute } = require('../utils/publicUrl');
 
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'http://localhost:4000';
-const absoluteUrl = (filename) => filename ? `${PUBLIC_BASE_URL}/uploads/${filename}` : null;
+const router = express.Router();
 
 // Deterministic image public_id for a content item; also matched on delete.
 const itemImageId = (itemId) => `hsitem_${itemId}`;
+
+// itemId is caller-supplied and reaches path.join() via writeImageToDisk's
+// `hsitem_${itemId}.jpg`, so a value like `../../evil` escapes UPLOAD_DIR.
+// The endpoint is admin-gated, making this hardening rather than an open
+// hole — but the constraint costs nothing and the ids the client actually
+// sends are already plain slugs.
+const SAFE_ITEM_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 const TARGET_TYPES = ['SERVICE', 'CUSTOM_ROUTE', 'EXTERNAL_URL', 'NONE'];
 
@@ -70,9 +76,7 @@ function normalizeTarget(item) {
           title: item.serviceId.title,
           price: item.serviceId.price,
           category: item.serviceId.category || '',
-          imageUrl: isHttp(item.serviceId.imageUrl)
-            ? item.serviceId.imageUrl
-            : absoluteUrl(item.serviceId.imageUrl),
+          imageUrl: toAbsolute(item.serviceId.imageUrl),
           status: item.serviceId.status || 'active',
         }
       : null,
@@ -83,9 +87,7 @@ function decorate(doc) {
   const obj = doc.toJSON();
   obj.contentData = (obj.contentData || []).map((item) => ({
     ...item,
-    ...(item.imageUrl && !isHttp(item.imageUrl)
-      ? { imageUrl: absoluteUrl(item.imageUrl) }
-      : {}),
+    ...(item.imageUrl ? { imageUrl: toAbsolute(item.imageUrl) } : {}),
     ...normalizeTarget(item),
   }));
   return obj;
@@ -370,10 +372,14 @@ router.post('/images', requireRole('admin'), upload.single('image'), async (req,
     if (!req.file) return res.status(400).json({ message: 'image file is required' });
     const itemId = req.body.itemId && String(req.body.itemId).trim();
     if (!itemId) return res.status(400).json({ message: 'itemId is required' });
+    if (!SAFE_ITEM_ID.test(itemId)) {
+      return res.status(400).json({
+        message: 'itemId must be letters, digits, hyphens or underscores',
+      });
+    }
 
     const stored = await storeImage(req.file.buffer, itemImageId(itemId));
-    const imageUrl = /^https?:\/\//i.test(stored) ? stored : absoluteUrl(stored);
-    res.status(201).json({ imageUrl });
+    res.status(201).json({ imageUrl: toAbsolute(stored) });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

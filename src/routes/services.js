@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Service = require('../models/Service');
 const {
   upload,
@@ -7,17 +8,14 @@ const {
 } = require('../middleware/upload');
 // Redis read-cache: GET is cached for 5 min; every write purges it.
 const { cache, invalidateOnSuccess } = require('../services/cacheService');
+const { requireRole } = require('../middleware/auth');
+const { toAbsolute } = require('../utils/publicUrl');
 
 const router = express.Router();
 
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'http://localhost:4000';
-const imageUrl = (filename) => filename ? `${PUBLIC_BASE_URL}/uploads/${filename}` : null;
-
 function decorate(doc) {
   const obj = doc.toJSON();
-  if (obj.imageUrl && !/^https?:\/\//i.test(obj.imageUrl)) {
-    obj.imageUrl = imageUrl(obj.imageUrl);
-  }
+  obj.imageUrl = toAbsolute(obj.imageUrl);
   return obj;
 }
 
@@ -36,7 +34,7 @@ router.get('/', cache('services'), async (req, res) => {
 });
 
 // POST /api/services  (multipart: fields + image)
-router.post('/', invalidateOnSuccess('services'), upload.single('image'), async (req, res) => {
+router.post('/', requireRole('admin'), invalidateOnSuccess('services'), upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'image is required' });
     const { title, price, description, category, duration, status } = req.body;
@@ -46,7 +44,17 @@ router.post('/', invalidateOnSuccess('services'), upload.single('image'), async 
       return res.status(400).json({ message: 'price must be > 0' });
     }
 
+    // Store the image BEFORE creating the row. Service.imageUrl defaults to
+    // null (models/Service.js), so creating first meant a storeImage failure
+    // left a permanent image-less service behind — visible in the admin list
+    // on the next GET despite this endpoint's "image is required" contract.
+    // The _id is only needed as a stable publicId, so mint it up front.
+    const _id = new mongoose.Types.ObjectId();
+    const imageUrl = await storeImage(req.file.buffer, _id.toString());
+
     const doc = await Service.create({
+      _id,
+      imageUrl,
       title: title.trim(),
       price: priceNum,
       description: description || '',
@@ -55,9 +63,6 @@ router.post('/', invalidateOnSuccess('services'), upload.single('image'), async 
       status: status === 'inactive' ? 'inactive' : 'active',
     });
 
-    doc.imageUrl = await storeImage(req.file.buffer, doc._id.toString());
-    await doc.save();
-
     res.status(201).json(decorate(doc));
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -65,7 +70,7 @@ router.post('/', invalidateOnSuccess('services'), upload.single('image'), async 
 });
 
 // PUT /api/services/:id  (multipart: fields + optional new image)
-router.put('/:id', invalidateOnSuccess('services'), upload.single('image'), async (req, res) => {
+router.put('/:id', requireRole('admin'), invalidateOnSuccess('services'), upload.single('image'), async (req, res) => {
   try {
     const doc = await Service.findById(req.params.id);
     if (!doc) return res.status(404).json({ message: 'Service not found' });
@@ -100,7 +105,7 @@ router.put('/:id', invalidateOnSuccess('services'), upload.single('image'), asyn
 });
 
 // PATCH /api/services/:id/status  { status: "active" | "inactive" }
-router.patch('/:id/status', invalidateOnSuccess('services'), async (req, res) => {
+router.patch('/:id/status', requireRole('admin'), invalidateOnSuccess('services'), async (req, res) => {
   try {
     const { status } = req.body;
     if (!['active', 'inactive'].includes(status)) {
@@ -119,7 +124,7 @@ router.patch('/:id/status', invalidateOnSuccess('services'), async (req, res) =>
 });
 
 // DELETE /api/services/:id
-router.delete('/:id', invalidateOnSuccess('services'), async (req, res) => {
+router.delete('/:id', requireRole('admin'), invalidateOnSuccess('services'), async (req, res) => {
   try {
     const doc = await Service.findByIdAndDelete(req.params.id);
     if (!doc) return res.status(404).json({ message: 'Service not found' });

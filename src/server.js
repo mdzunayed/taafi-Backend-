@@ -45,12 +45,47 @@ const { normalizePhone } = require('./utils/phone');
 const { UPLOAD_DIR } = require('./middleware/upload');
 // Magic-byte Content-Type detection for the /uploads static mount.
 const { sniffImageMime } = require('./utils/imageMime');
+const cloudinary = require('./middleware/cloudinary');
+const publicUrl = require('./utils/publicUrl');
+const { uploadErrorHandler } = require('./middleware/uploadErrors');
 // Production security stack (helmet + CORS allow-list + rate limiting) and
 // the NoSQL-injection sanitizer.
 const security = require('./middleware/security');
 // Redis-backed background worker + connection lifecycle.
 const { startWorker, closeQueue } = require('./queues/notificationQueue');
 const { closeAll: closeRedis } = require('./config/redis');
+
+// ── Storage preflight ─────────────────────────────────────────────────────
+// Fail-closed on an UNSET NODE_ENV, matching the rate-limiter's reasoning in
+// middleware/security.js: a Render service created by hand in the dashboard
+// (rather than from render.yaml) has no NODE_ENV, and that must never be the
+// thing that silently downgrades production to ephemeral local disk.
+const isDevOrTest = ['development', 'test'].includes(process.env.NODE_ENV);
+
+if (!isDevOrTest && !cloudinary.isEnabled()) {
+  console.error(
+    '\n[boot] FATAL: Cloudinary is not configured.\n' +
+      "  Render's filesystem is ephemeral — images written to ./uploads are\n" +
+      '  wiped on the next sleep or redeploy, so uploads would silently\n' +
+      '  disappear rather than fail. Refusing to start in that state.\n\n' +
+      '  Fix: set CLOUDINARY_URL in the Render dashboard (see DEPLOY.md),\n' +
+      '  or set NODE_ENV=development to opt into the local disk fallback.\n',
+  );
+  process.exit(1);
+}
+
+// Not fatal: Cloudinary URLs are absolute and self-contained, so a missing
+// PUBLIC_BASE_URL only breaks the disk-fallback path and any pre-Cloudinary
+// rows. Loud, though — the failure it causes (images that resolve to
+// localhost on a physical device) looks nothing like a config problem.
+if (!publicUrl.isConfigured()) {
+  console.warn(
+    `[boot] WARNING: PUBLIC_BASE_URL is unset — falling back to ` +
+      `${publicUrl.PUBLIC_BASE_URL}.\n` +
+      '  Any image served from /uploads will be handed to clients as a\n' +
+      '  localhost URL, which no phone or remote browser can reach.',
+  );
+}
 
 const app = express();
 
@@ -174,6 +209,11 @@ app.use('/api/dependents', dependentRouter);
 // Best-effort FCM warm-up. No-ops gracefully when the firebase-admin
 // SDK or service-account credentials aren't configured.
 fcmService.init();
+
+// Translates multer rejections (size / mimetype / field name) into real 4xx
+// status codes. MUST stay ahead of the generic handler below, which would
+// otherwise report all of them as 500s. See middleware/uploadErrors.js.
+app.use(uploadErrorHandler);
 
 app.use((err, _req, res, _next) => {
   console.error(err);
