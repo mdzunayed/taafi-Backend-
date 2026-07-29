@@ -13,14 +13,18 @@ const multer = require('multer');
 
 // fileFilter (middleware/upload.js) rejects with a plain Error, not a
 // MulterError, so it has to be matched separately. It tags the error with
-// code 'INVALID_FILE_TYPE'; the message regex is kept only as a fallback for
-// an error raised somewhere that predates the tag.
-const MIMETYPE_REJECTION = /Only JPEG \/ PNG \/ WEBP images are allowed/i;
+// code 'ONLY_ALLOWED_IMAGES'. The older 'INVALID_FILE_TYPE' tag and the
+// message regex are both kept as fallbacks: a request already in flight
+// across a deploy, or an error raised somewhere that predates either tag,
+// must not regress to a 500.
+const MIMETYPE_REJECTION = /only jpeg[ ,/]+png[ ,/]*(and )?webp images are allowed/i;
+
+const REJECTION_CODES = new Set(['ONLY_ALLOWED_IMAGES', 'INVALID_FILE_TYPE']);
 
 function isMimetypeRejection(err) {
   if (!err) return false;
   return (
-    err.code === 'INVALID_FILE_TYPE' || MIMETYPE_REJECTION.test(err.message || '')
+    REJECTION_CODES.has(err.code) || MIMETYPE_REJECTION.test(err.message || '')
   );
 }
 

@@ -16,18 +16,36 @@ const storage = multer.memoryStorage();
 
 // `image/jpg` is not a registered MIME type, but enough clients send it that
 // rejecting it would only produce confusing failures for real JPEGs.
-const ALLOWED_MIME = /^image\/(jpeg|jpg|png|webp)$/i;
+const ALLOWED_MIME = new Set([
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/webp',
+]);
 
+// Checked alongside the MIME type rather than instead of it. The Content-Type
+// on a multipart part is whatever the client chose to write there, so a
+// `payload.svg` announced as `image/jpeg` passed the old MIME-only test and
+// reached storeImage. Requiring the extension to agree closes that.
+const ALLOWED_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+
+// Every client in this repo sends a name with an extension — dio_client
+// defaults to avatar.jpg / attachment.jpg and prepareImageForUpload falls back
+// to upload.jpg — so an extensionless upload is a malformed request, not a
+// legitimate caller we would be breaking.
 const upload = multer({
   storage,
   limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
   fileFilter: (_req, file, cb) => {
-    if (!ALLOWED_MIME.test(file.mimetype)) {
-      const err = new Error('Only JPEG / PNG / WEBP images are allowed');
+    const mime = String(file.mimetype || '').toLowerCase();
+    const ext = path.extname(file.originalname || '').toLowerCase();
+
+    if (!ALLOWED_MIME.has(mime) || !ALLOWED_EXT.has(ext)) {
+      const err = new Error('Only JPEG, PNG, and WEBP images are allowed.');
       // Tag it so uploadErrors.js can recognise this rejection by code
       // instead of regex-matching the message string across two files.
-      err.code = 'INVALID_FILE_TYPE';
-      return cb(err);
+      err.code = 'ONLY_ALLOWED_IMAGES';
+      return cb(err, false);
     }
     cb(null, true);
   },

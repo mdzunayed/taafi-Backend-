@@ -43,7 +43,14 @@ function buildApp() {
 
 async function post(fields) {
   const form = new FormData();
-  for (const [name, { bytes, filename, type }] of Object.entries(fields)) {
+  for (const [name, value] of Object.entries(fields)) {
+    // A plain string is a text field, not a file part — that's how the
+    // "metadata-only edit" case sends a body with no upload in it at all.
+    if (typeof value === 'string') {
+      form.append(name, value);
+      continue;
+    }
+    const { bytes, filename, type } = value;
     form.append(name, new Blob([bytes], { type }), filename);
   }
   const res = await fetch(`http://127.0.0.1:${PORT}/upload`, {
@@ -96,7 +103,48 @@ const cases = [
       },
     },
     expectStatus: 415,
-    check: (body) => assert.match(body.message, /JPEG \/ PNG \/ WEBP/i),
+    check: (body) => assert.match(body.message, /JPEG, PNG, and WEBP/i),
+  },
+  {
+    // The Content-Type on a multipart part is client-controlled, so a
+    // MIME-only filter is trivially bypassed by announcing image/jpeg. This is
+    // the case the old regex-on-mimetype let straight through to storeImage.
+    name: 'allowed mimetype but disallowed extension -> 415',
+    fields: {
+      image: {
+        bytes: jpegOfSize(2048),
+        filename: 'payload.svg',
+        type: 'image/jpeg',
+      },
+    },
+    expectStatus: 415,
+    check: (body) => assert.match(body.message, /JPEG, PNG, and WEBP/i),
+  },
+  {
+    // Extension casing comes from whatever the user's camera/OS produced;
+    // rejecting IMG_0042.JPG would be a filter bug, not a security win.
+    name: 'uppercase extension is accepted',
+    fields: {
+      image: {
+        bytes: jpegOfSize(2048),
+        filename: 'IMG_0042.JPG',
+        type: 'image/jpeg',
+      },
+    },
+    expectStatus: 200,
+    check: (body) => assert.equal(body.ok, true),
+  },
+  {
+    // The reported bug: editing a service without touching its photo. The
+    // frontend omits the `image` part entirely, so fileFilter must never run
+    // and the handler must see req.file === undefined.
+    name: 'metadata-only edit (no file part) reaches the handler',
+    fields: { title: 'Renamed service', price: '900', status: 'active' },
+    expectStatus: 200,
+    check: (body) => {
+      assert.equal(body.ok, true);
+      assert.equal(body.size, 0, 'no file should have been parsed');
+    },
   },
   {
     name: 'wrong field name -> 400 naming the field (was 500)',
