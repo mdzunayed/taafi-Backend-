@@ -138,20 +138,55 @@ function parseAllowedOrigins() {
     .filter(Boolean);
 }
 
+// `flutter run -d chrome` binds a NEW random port on every launch, so a local
+// web build can never be named in an exact-match allow-list. Matching loopback
+// hosts on any port is the only way to express "my own machine" — without it,
+// the standard dev loop (local Flutter Web against the deployed API) fails its
+// preflight, and Dio on web reports that as a bare `XMLHttpRequest error` with
+// no status, which looks nothing like a CORS problem.
+//
+// Anchored at both ends, and the host alternatives reject anything with a
+// prefix or suffix, so `https://localhost.attacker.com` does NOT match.
+const LOOPBACK_ORIGIN =
+  /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+
+function isDevOrTestEnv() {
+  return ['development', 'test'].includes(process.env.NODE_ENV);
+}
+
+// Opt-in in production: an operator debugging the web admin against the live
+// API sets CORS_ALLOW_LOCALHOST=1 for as long as they need it, rather than the
+// deployment trusting every page on every viewer's machine by default.
+function allowsLocalhost() {
+  return isDevOrTestEnv() || process.env.CORS_ALLOW_LOCALHOST === '1';
+}
+
 function buildCors() {
   const allowList = parseAllowedOrigins();
   const devMode = allowList.length === 0;
+  const allowLocalhost = allowsLocalhost();
   return cors({
     origin(origin, cb) {
       // No Origin header → native app / server-to-server / curl → allow.
       if (!origin) return cb(null, true);
       if (devMode) return cb(null, true); // permissive fallback for local dev
       if (allowList.includes(origin)) return cb(null, true);
+      if (allowLocalhost && LOOPBACK_ORIGIN.test(origin)) return cb(null, true);
       // Disallowed browser origin: resolve WITHOUT the Access-Control-Allow-
       // Origin header (cb(null, false)) rather than throwing. The browser
       // then blocks the response client-side, and we avoid a noisy 500 /
       // error-handler round-trip on every rejected preflight.
-      console.warn(`[security] CORS blocked origin: ${origin}`);
+      //
+      // Name the remedy in the log line: this rejection is invisible from the
+      // browser side beyond a generic network error, so the server log is the
+      // only place the cause can be read.
+      console.warn(
+        `[security] CORS blocked origin: ${origin} — add it to ` +
+          'CORS_ALLOWED_ORIGINS' +
+          (LOOPBACK_ORIGIN.test(origin)
+            ? ', or set CORS_ALLOW_LOCALHOST=1 to allow loopback origins on any port'
+            : ''),
+      );
       return cb(null, false);
     },
     credentials: true,
@@ -207,6 +242,28 @@ function applySecurity(app) {
   app.set('trust proxy', Number.isFinite(hops) ? hops : 1);
 
   app.disable('x-powered-by');
+
+  // An empty allow-list silently flips CORS to reflect-any-origin WITH
+  // credentials:true — the opposite of how NODE_ENV is treated a few lines
+  // up, and easy to ship by accident because render.yaml lists
+  // CORS_ALLOWED_ORIGINS as optional. Warn rather than exit: a running
+  // deployment must not start crash-looping on a redeploy over this.
+  if (!isDevOrTestEnv() && parseAllowedOrigins().length === 0) {
+    console.warn(
+      '[security] WARNING: CORS_ALLOWED_ORIGINS is unset outside dev/test —\n' +
+        '  every browser origin is being reflected with credentials enabled.\n' +
+        '  Set it to your admin console origin(s), comma-separated. Native\n' +
+        '  Flutter clients send no Origin header and are unaffected.',
+    );
+  }
+  if (!isDevOrTestEnv() && process.env.CORS_ALLOW_LOCALHOST === '1') {
+    console.warn(
+      '[security] NOTE: CORS_ALLOW_LOCALHOST=1 — loopback origins on any port\n' +
+        '  are accepted. Intended for local frontend development against this\n' +
+        '  deployment; unset it when you are done.',
+    );
+  }
+
   app.use(buildHelmet());
   app.use(buildCors());
   // Sanitize runs after the body parsers are mounted (server.js mounts them

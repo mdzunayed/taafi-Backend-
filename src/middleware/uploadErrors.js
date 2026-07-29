@@ -12,9 +12,17 @@ const multer = require('multer');
 // "your file is too big" from "the database is down".
 
 // fileFilter (middleware/upload.js) rejects with a plain Error, not a
-// MulterError, so it has to be matched separately. Kept in sync with the
-// message thrown there.
+// MulterError, so it has to be matched separately. It tags the error with
+// code 'INVALID_FILE_TYPE'; the message regex is kept only as a fallback for
+// an error raised somewhere that predates the tag.
 const MIMETYPE_REJECTION = /Only JPEG \/ PNG \/ WEBP images are allowed/i;
+
+function isMimetypeRejection(err) {
+  if (!err) return false;
+  return (
+    err.code === 'INVALID_FILE_TYPE' || MIMETYPE_REJECTION.test(err.message || '')
+  );
+}
 
 const CODE_MAP = {
   LIMIT_FILE_SIZE: [413, 'Image is larger than the 8 MB limit.'],
@@ -28,8 +36,8 @@ const CODE_MAP = {
 
 function uploadErrorHandler(err, _req, res, next) {
   if (!(err instanceof multer.MulterError)) {
-    if (err && MIMETYPE_REJECTION.test(err.message || '')) {
-      return res.status(415).json({ message: err.message });
+    if (isMimetypeRejection(err)) {
+      return res.status(415).json({ success: false, message: err.message });
     }
     return next(err);
   }
@@ -41,7 +49,7 @@ function uploadErrorHandler(err, _req, res, next) {
   // the field turns it into a one-line fix.
   const detail = err.field ? `${message} (field "${err.field}")` : message;
 
-  return res.status(status).json({ message: detail });
+  return res.status(status).json({ success: false, message: detail });
 }
 
 module.exports = { uploadErrorHandler };

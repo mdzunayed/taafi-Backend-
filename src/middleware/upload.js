@@ -1,21 +1,33 @@
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
+const cloudinary = require('./cloudinary');
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', '..', 'uploads');
 
-if (!fs.existsSync(UPLOAD_DIR)) {
+// Only the disk fallback needs the directory. With Cloudinary configured
+// nothing ever reads it, and creating it on a read-only or ephemeral
+// filesystem is noise at best.
+if (!cloudinary.isEnabled() && !fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
 const storage = multer.memoryStorage();
 
+// `image/jpg` is not a registered MIME type, but enough clients send it that
+// rejecting it would only produce confusing failures for real JPEGs.
+const ALLOWED_MIME = /^image\/(jpeg|jpg|png|webp)$/i;
+
 const upload = multer({
   storage,
   limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
   fileFilter: (_req, file, cb) => {
-    if (!/^image\/(jpeg|jpg|png|webp)$/i.test(file.mimetype)) {
-      return cb(new Error('Only JPEG / PNG / WEBP images are allowed'));
+    if (!ALLOWED_MIME.test(file.mimetype)) {
+      const err = new Error('Only JPEG / PNG / WEBP images are allowed');
+      // Tag it so uploadErrors.js can recognise this rejection by code
+      // instead of regex-matching the message string across two files.
+      err.code = 'INVALID_FILE_TYPE';
+      return cb(err);
     }
     cb(null, true);
   },
@@ -34,8 +46,6 @@ function deleteImageFromDisk(serviceId) {
     fs.unlinkSync(fullPath);
   }
 }
-
-const cloudinary = require('./cloudinary');
 
 // Unified image writer. Returns the value to store in the document's
 // image field:

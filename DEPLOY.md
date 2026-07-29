@@ -47,6 +47,11 @@ this step, uploads will appear to work and then disappear.
 1. Sign up at <https://cloudinary.com> (free tier is generous).
 2. Dashboard → copy the **API Environment variable**, the
    `CLOUDINARY_URL=cloudinary://...` one.
+3. Check which key you copied. Cloudinary supports additional scoped API keys,
+   and one without the **`create`** action authenticates fine but refuses every
+   upload with `403 … missing permissions (actions=["create"])`. The server
+   boots normally in that state and only fails at upload time. Use the primary
+   key, or grant `create` under **Settings → API Keys**.
 
 ## 3. Push to GitHub
 
@@ -75,7 +80,17 @@ secrets belong in Render's dashboard instead.
    | `JWT_SECRET` | generate one: `openssl rand -hex 32` |
    | `CLOUDINARY_URL` | from step 2 |
    | `PUBLIC_BASE_URL` | leave blank for now — you don't know the URL yet |
-   | `CORS_ALLOWED_ORIGINS` | leave blank if you only ship the mobile app |
+   | `CORS_ALLOWED_ORIGINS` | your web admin origin(s), comma-separated — see the warning below |
+
+   > `CORS_ALLOWED_ORIGINS` does **not** fail closed. Left blank, the API
+   > reflects every browser origin with credentials enabled — so set it even if
+   > you only ship the mobile app. The server warns about this at boot.
+   >
+   > To point a local `flutter run -d chrome` build at the deployed API, also
+   > set `CORS_ALLOW_LOCALHOST=1`: Flutter Web binds a new random port each
+   > launch, which an exact-match allow-list can never cover. Unset it when you
+   > are finished — otherwise the deployment permanently trusts any page running
+   > on a viewer's own machine.
 
 4. Deploy. First build takes ~3–5 minutes.
 
@@ -174,6 +189,21 @@ raise `RATE_LIMIT_MAX` (default 1000 per IP per 15 min). Admin routes
 **Uploaded images 404 after a redeploy** — `CLOUDINARY_URL` is unset, so
 uploads went to the ephemeral disk. Set it; note that images uploaded before
 the fix are gone for good.
+
+**Every upload returns 502 "Cloudinary forbade the upload"** — the API key is
+valid but has no upload permission. See step 2.3 above.
+
+**Every upload returns 502 "Cloudinary rejected the credentials"** — the
+key/secret pair is wrong. Verify with:
+
+```bash
+node -e "require('dotenv').config();require('./src/middleware/cloudinary');require('cloudinary').v2.api.ping().then(console.log,e=>console.log(e.message))"
+```
+
+**Flutter Web gets `XMLHttpRequest error` with no status** — almost always a
+blocked CORS preflight rather than a server fault; the browser reports both
+identically. Check the server log for `[security] CORS blocked origin:`, which
+names the origin and the variable that would admit it.
 
 **Socket.io disconnects constantly** — expected when the instance sleeps.
 The Flutter client should reconnect automatically; verify its reconnect

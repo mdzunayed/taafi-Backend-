@@ -63,12 +63,28 @@ const { closeAll: closeRedis } = require('./config/redis');
 const isDevOrTest = ['development', 'test'].includes(process.env.NODE_ENV);
 
 if (!isDevOrTest && !cloudinary.isEnabled()) {
+  // isEnabled() reflects what the SDK actually resolved, not merely which env
+  // vars are present — so this also catches credentials that were supplied but
+  // did not survive parsing, which is a far more confusing failure than an
+  // outright missing var (uploads 500 at request time while boot looks clean).
+  // Asked of the module rather than read from process.env: a malformed
+  // CLOUDINARY_URL is unset there by the time we get here, precisely so the
+  // SDK cannot throw on it during require.
+  const supplied = cloudinary.configuredVarNames();
+
   console.error(
     '\n[boot] FATAL: Cloudinary is not configured.\n' +
       "  Render's filesystem is ephemeral — images written to ./uploads are\n" +
       '  wiped on the next sleep or redeploy, so uploads would silently\n' +
       '  disappear rather than fail. Refusing to start in that state.\n\n' +
-      '  Fix: set CLOUDINARY_URL in the Render dashboard (see DEPLOY.md),\n' +
+      (supplied.length
+        ? `  ${supplied.join(', ')} ${supplied.length > 1 ? 'are' : 'is'} set ` +
+          'but did not resolve to a\n  complete credential set. ' +
+          'Check the value formatting — CLOUDINARY_URL must\n' +
+          '  read cloudinary://<api_key>:<api_secret>@<cloud_name>, and a\n' +
+          '  secret containing @ or : has to be percent-encoded.\n'
+        : '  No Cloudinary variables are set at all.\n') +
+      '\n  Fix: set CLOUDINARY_URL in the Render dashboard (see DEPLOY.md),\n' +
       '  or set NODE_ENV=development to opt into the local disk fallback.\n',
   );
   process.exit(1);
@@ -215,9 +231,16 @@ fcmService.init();
 // otherwise report all of them as 500s. See middleware/uploadErrors.js.
 app.use(uploadErrorHandler);
 
-app.use((err, _req, res, _next) => {
-  console.error(err);
-  res.status(err.status || 500).json({ message: err.message || 'Server error' });
+app.use((err, req, res, _next) => {
+  const status = err.status || 500;
+  // Include the method+path: a 5xx body reaches the client stripped of context,
+  // and on Flutter Web a failed request is reported as a bare
+  // `XMLHttpRequest error`, so the log line is the only place the two can be
+  // correlated. `success: false` matches the envelope the controllers use.
+  console.error(`[error] ${req.method} ${req.originalUrl} -> ${status}`, err);
+  res
+    .status(status)
+    .json({ success: false, message: err.message || 'Server error' });
 });
 
 // Render (and every other PaaS) injects the port to bind on via $PORT — it

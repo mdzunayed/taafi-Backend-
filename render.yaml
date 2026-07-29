@@ -43,7 +43,11 @@ services:
         sync: false
       - key: JWT_SECRET # openssl rand -hex 32
         sync: false
-      - key: CLOUDINARY_URL # cloudinary://<key>:<secret>@<cloud_name>
+      # cloudinary://<api_key>:<api_secret>@<cloud_name>
+      # Copy it verbatim from the Cloudinary console; percent-encode a secret
+      # containing @ or :. The key must have upload ("create") permission — a
+      # read-only scoped key boots fine and then 403s on every upload.
+      - key: CLOUDINARY_URL
         sync: false
       # Public origin of THIS service, e.g. https://taafi-api.onrender.com
       # Used to build absolute /uploads URLs. Set after the first deploy,
@@ -51,7 +55,13 @@ services:
       - key: PUBLIC_BASE_URL
         sync: false
       # Comma-separated browser origins for the web admin console. Native
-      # Flutter/APK clients send no Origin header and are always allowed,
-      # so this can stay unset if you only ship the mobile app.
+      # Flutter/APK clients send no Origin header and are always allowed.
+      # Do NOT leave this unset: an empty list does not fail closed, it makes
+      # the API reflect EVERY browser origin with credentials enabled.
       - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      # Set to 1 to additionally accept loopback origins on any port, so a
+      # local `flutter run -d chrome` build can call this deployed API during
+      # development. Leave unset otherwise.
+      - key: CORS_ALLOW_LOCALHOST
         sync: false
