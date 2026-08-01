@@ -9,6 +9,12 @@
 const mongoose = require('mongoose');
 const Provider = require('../models/Provider');
 const Account = require('../models/Account');
+const {
+  NURSE,
+  normalizeProviderType,
+  providerTypeFromRole,
+} = require('./providerTypes');
+const { describeMilestone } = require('./bookingMilestones');
 
 function firstNonEmpty(...values) {
   for (const v of values) {
@@ -133,6 +139,94 @@ function credentialsComplete(provider) {
   );
 }
 
+// How the provider's role should read on the patient's card, e.g. "General
+// Physician", "Senior Care Nurse". Built from what the provider actually
+// filled in — specialisation first, then their current designation from the
+// most recent experience row, then their degrees. Returns '' when the profile
+// carries none of it: a blank line is honest, an invented title is not.
+function designationFor({ provider, account }) {
+  const p = provider || {};
+  const latest = Array.isArray(p.experience) && p.experience.length
+    ? p.experience[p.experience.length - 1]
+    : null;
+  return String(
+    firstNonEmpty(
+      p.specialization,
+      p.specialty,
+      latest && latest.designation,
+      p.degrees,
+      account && account.designation,
+    ) || '',
+  ).trim();
+}
+
+/**
+ * Snapshot of the provider the patient is expecting at their door — name,
+ * photo, phone, designation and registration number — in the shape the
+ * `care_requests.assigned_provider` sub-document stores.
+ *
+ * `stored` is that sub-document as it was frozen at dispatch time. Live
+ * provider fields win where they exist (a provider who changed their number
+ * must be reachable on the new one), and the snapshot fills every gap, so a
+ * booking whose provider has since left the platform still renders a complete
+ * card. Returns null when neither source can even name the provider — the UI
+ * treats that as "no provider assigned yet" and shows nothing.
+ */
+function buildAssignedProvider({ provider, account, stored, providerType }) {
+  const p = provider || {};
+  const a = account || {};
+  const snapshot = stored || {};
+
+  const type =
+    normalizeProviderType(providerType) ||
+    providerTypeFromRole(firstNonEmpty(p.role, a.role)) ||
+    normalizeProviderType(snapshot.provider_type) ||
+    null;
+
+  const isNurse = type === NURSE;
+  const name = String(
+    firstNonEmpty(p.full_name, a.full_name, snapshot.name) || '',
+  ).trim();
+  if (!name) return null;
+
+  const blankToNull = (v) => {
+    const s = String(v == null ? '' : v).trim();
+    return s === '' ? null : s;
+  };
+
+  return {
+    provider_id:
+      (provider && provider._id ? provider._id.toString() : null) ||
+      (account && account._id ? account._id.toString() : null) ||
+      (snapshot.provider_id ? snapshot.provider_id.toString() : null),
+    provider_type: type,
+    name,
+    photo_url: blankToNull(
+      firstNonEmpty(
+        p.profile_picture,
+        a.profile_picture,
+        a.photo_url,
+        snapshot.photo_url,
+      ),
+    ),
+    phone: blankToNull(firstNonEmpty(p.phone, a.phone, snapshot.phone)),
+    designation: blankToNull(
+      firstNonEmpty(designationFor({ provider, account }), snapshot.designation),
+    ),
+    // Whichever council the provider's role answers to, falling back to the
+    // other licence field so a mis-filed number still reaches the patient.
+    registration_no: blankToNull(
+      firstNonEmpty(
+        isNurse ? p.nursing_license : p.bmdc_license,
+        p.bmdc_license,
+        p.nursing_license,
+        snapshot.registration_no,
+      ),
+    ),
+    assigned_at: snapshot.assigned_at || null,
+  };
+}
+
 // Attach populated doctor + nurse blocks onto a serialized CareRequest.
 // Returns the same JSON object, plus `doctor` and `nurse` fields (each
 // may be `null` when no assignment exists yet). Swallows lookup
@@ -155,6 +249,30 @@ async function attachDoctorToRequest(requestJson) {
 
   requestJson.doctor = doctorPair ? buildDoctorView(doctorPair) : null;
   requestJson.nurse = nursePair ? buildDoctorView(nursePair) : null;
+
+  // The single provider the patient coordinates with directly. A dual team is
+  // led by the doctor, so they are the contact; a nurse-only visit is the
+  // nurse. Built live off the provider record and backfilled from the
+  // dispatch-time snapshot, so it is correct for bookings dispatched before
+  // the snapshot field existed too.
+  const stored = requestJson.assigned_provider || null;
+  const leadPair = doctorPair || nursePair;
+  const assignedProvider = leadPair
+    ? buildAssignedProvider({
+        ...leadPair,
+        stored,
+        providerType: stored && stored.provider_type,
+      })
+    : stored && stored.name
+      ? buildAssignedProvider({ provider: null, account: null, stored })
+      : null;
+  requestJson.assigned_provider = assignedProvider;
+
+  // Re-derive the tracker now that the attending role is known for certain.
+  // `describeMilestone` already ran inside the model's toJSON transform, but
+  // it could only see the stored snapshot — a legacy booking dispatched before
+  // that field existed would have been worded from `care_type` alone.
+  Object.assign(requestJson, describeMilestone(requestJson));
   return requestJson;
 }
 
@@ -195,6 +313,8 @@ module.exports = {
   loadDoctorPair,
   loadProviderPair,
   buildDoctorView,
+  buildAssignedProvider,
+  designationFor,
   credentialsComplete,
   attachDoctorToRequest,
   withDoctorBlocks,

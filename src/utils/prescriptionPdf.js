@@ -129,6 +129,12 @@ function fmtLongDate(d) {
   });
 }
 
+// Sentence-case a free-text enum-ish value ("female" → "Female").
+function cap(s) {
+  const v = String(s ?? '').trim();
+  return v ? v[0].toUpperCase() + v.slice(1) : '';
+}
+
 function trimNum(n) {
   if (n === null || n === undefined) return '';
   return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(1)));
@@ -191,6 +197,35 @@ function buildPrescriptionHtml(doc, doctor) {
   const brandName = (brand && brand.brand_name) || TAAFI_BRAND;
   const brandTagline = (brand && brand.tagline) || TAAFI_TAGLINE;
 
+  // "Patient: <name>   ·   62 yrs · Female   ·   Mother" — mirrors the
+  // in-app pad's patient line so the printed script names the person it
+  // was written for.
+  const ps = doc.patient_snapshot || null;
+  const patientMeta = ps
+    ? [
+        [
+          ps.age != null ? `${ps.age} yrs` : '',
+          cap(ps.gender),
+          ps.blood_group && ps.blood_group.toLowerCase() !== 'unknown'
+            ? ps.blood_group
+            : '',
+        ]
+          .filter(Boolean)
+          .join(' · '),
+        cap(ps.relationship),
+      ]
+        .filter(Boolean)
+        .map(esc)
+        .join('&nbsp;&nbsp;·&nbsp;&nbsp;')
+    : '';
+  const patientHtml =
+    ps && ps.name
+      ? `<div class="patient"><span class="pk">Patient:</span> ` +
+        `<span class="pv">${esc(ps.name)}</span>` +
+        (patientMeta ? `<span class="pm">${patientMeta}</span>` : '') +
+        '</div>'
+      : '';
+
   const vitalsPairs = [
     ['Date', fmtDate(doc.issued_at)],
     ['Diagnosis', doc.diagnosis || ''],
@@ -252,15 +287,22 @@ function buildPrescriptionHtml(doc, doctor) {
     color: ${PAD_INK};
     font-size: 12px;
   }
-  .header { display: flex; justify-content: space-between; align-items: flex-start; }
+  .header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+  /* Same 3:2 split as the in-app pad so the credentials block can never
+     be squeezed by the brand tagline. */
+  .header > .credentials { flex: 3 1 0; min-width: 0; }
   .doc-name { font-size: 19px; font-weight: 800; line-height: 1.2; }
   .doc-degrees { color: ${PAD_INK_SOFT}; font-size: 13px; font-weight: 600; margin-top: 3px; }
   .doc-hospital { color: ${PAD_INK}; font-size: 12px; font-weight: 600; margin-top: 2px; }
   .doc-meta { color: ${PAD_INK_SOFT}; font-size: 12px; margin-top: 2px; }
-  .brand { text-align: right; }
+  .brand { text-align: right; flex: 2 1 0; min-width: 0; }
   .brand-name { color: ${PAD_BRAND}; font-size: 26px; font-weight: 900; letter-spacing: .5px; line-height: 1.1; }
   .brand-tag { color: ${PAD_INK_SOFT}; font-size: 10.5px; font-weight: 600; letter-spacing: .2px; margin-top: 3px; }
   .rule { height: 1.5px; background: ${PAD_INK}; margin: 12px 0 14px; }
+  .patient { margin-bottom: 10px; }
+  .pk { color: ${PAD_INK_SOFT}; font-size: 12px; font-weight: 700; }
+  .pv { font-size: 13px; font-weight: 800; }
+  .pm { color: ${PAD_INK_SOFT}; font-size: 11.5px; font-weight: 600; margin-left: 14px; }
   .vitals { background: ${PAD_ROW_ALT}; border-radius: 8px; padding: 10px 14px; }
   .vital { display: inline-block; margin-right: 20px; line-height: 1.7; }
   .vk { color: ${PAD_INK_SOFT}; font-size: 11.5px; font-weight: 700; }
@@ -294,7 +336,7 @@ function buildPrescriptionHtml(doc, doctor) {
 </head>
 <body>
   <div class="header">
-    <div>
+    <div class="credentials">
       <div class="doc-name">${esc(displayName)}</div>
       ${doctor.degrees ? `<div class="doc-degrees">${esc(doctor.degrees)}</div>` : ''}
       ${doctor.hospitalOrCollege ? `<div class="doc-hospital">${esc(doctor.hospitalOrCollege)}</div>` : ''}
@@ -307,6 +349,7 @@ function buildPrescriptionHtml(doc, doctor) {
     </div>
   </div>
   <div class="rule"></div>
+  ${patientHtml}
   <div class="vitals">${vitalsHtml}</div>
   <div class="rx">Rx</div>
   <table>

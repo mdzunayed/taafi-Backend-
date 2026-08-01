@@ -171,6 +171,19 @@ router.post('/', requireAccountId, async (req, res) => {
     const weightKg = numOrNull(body.weightKg ?? body.weight_kg, 500);
     const heightCm = numOrNull(body.heightCm ?? body.height_cm, 300);
 
+    // Pad "Patient:" line. The doctor confirms/corrects the booked name
+    // on the prescribing form, so a supplied name outranks the booking's
+    // care-recipient / account-holder name below.
+    const patientNameInput = (body.patientName ?? body.patient_name ?? '')
+      .toString()
+      .trim()
+      .slice(0, 200);
+    const patientAgeInput = numOrNull(body.patientAge ?? body.patient_age, 130);
+    const patientGenderInput = (body.patientGender ?? body.patient_gender ?? '')
+      .toString()
+      .trim()
+      .slice(0, 40);
+
     // Credential gate — resolve the issuing doctor's Provider row BEFORE we
     // touch the visit's state. A script's `doctor_snapshot` (pad header) is
     // frozen from these credentials, so an incomplete profile would produce
@@ -285,20 +298,24 @@ router.post('/', requireAccountId, async (req, res) => {
           }
         : null;
 
-    // Target-patient identity: when the visit was booked for a dependent,
-    // freeze their name/age/sex onto the script so the pad prints the right
-    // person instead of the account holder. Null = self-booking.
+    // Target-patient identity frozen onto the script so the pad always
+    // prints who it is for. Name precedence: what the doctor typed on the
+    // form → the booking's care recipient (dependent) → the account
+    // holder. Age/sex ride along from the dependent block, or from the
+    // form when the doctor's client sent them for a self-booking.
     const cr =
       claimed.care_recipient && claimed.care_recipient.name
         ? claimed.care_recipient
         : null;
-    const patientSnapshot = cr
+    const patientName =
+      patientNameInput || (cr && cr.name) || claimed.patient_name || '';
+    const patientSnapshot = patientName
       ? {
-          name: cr.name || '',
-          age: ageFromDob(cr.date_of_birth),
-          gender: cr.gender || '',
-          relationship: cr.relationship || '',
-          blood_group: cr.blood_group || '',
+          name: patientName,
+          age: (cr ? ageFromDob(cr.date_of_birth) : null) ?? patientAgeInput,
+          gender: (cr && cr.gender) || patientGenderInput || '',
+          relationship: (cr && cr.relationship) || '',
+          blood_group: (cr && cr.blood_group) || '',
         }
       : null;
 

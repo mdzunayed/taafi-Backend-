@@ -7,6 +7,20 @@ const PromoBanner = require('./models/PromoBanner');
 const DynamicSection = require('./models/DynamicSection');
 const Account = require('./models/Account');
 const Provider = require('./models/Provider');
+const {
+  POST_OP,
+  DOCTOR_IN_HOME,
+  normalizeServiceCategory,
+} = require('./utils/serviceCategories');
+// Who attends each seeded service — drives the patient tracker's wording
+// ("Nurse On the Way" vs "Lab Technician On the Way") and its preparation tip.
+const {
+  DOCTOR,
+  NURSE,
+  PHYSIOTHERAPIST,
+  LAB_TECH,
+  inferProviderType,
+} = require('./utils/providerTypes');
 
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/taafi';
 
@@ -45,7 +59,8 @@ const seedDocs = [
     title: 'Post-surgery care',
     price: 2400,
     description: 'At-home wound dressing, vitals monitoring and recovery support.',
-    category: 'Recovery',
+    category: POST_OP,
+    provider_type: NURSE,
     duration: '2 hr',
     imageUrl: '6a0ec2e1e86225a7f36ba9a9.jpg',
     status: 'active',
@@ -55,7 +70,10 @@ const seedDocs = [
     title: 'Home physiotherapy',
     price: 1800,
     description: 'Certified physiotherapist visits for mobility and pain management.',
-    category: 'Rehabilitation',
+    // Physiotherapy is framed as part of the recovery track. Flip to '' if
+    // product decides it deserves a category of its own.
+    category: POST_OP,
+    provider_type: PHYSIOTHERAPIST,
     duration: '1 hr',
     imageUrl: '6a0ec337e86225a7f36ba9ad.jpg',
     status: 'active',
@@ -64,7 +82,8 @@ const seedDocs = [
     title: 'Doctor home visit',
     price: 1500,
     description: 'General consultation by a licensed doctor at your home.',
-    category: 'Consultation',
+    category: DOCTOR_IN_HOME,
+    provider_type: DOCTOR,
     duration: '45 min',
     imageUrl: null,
     status: 'active',
@@ -73,7 +92,9 @@ const seedDocs = [
     title: 'Nurse on call',
     price: 900,
     description: 'Trained nurse for IV, injections and short-term observation.',
-    category: 'Nursing',
+    // Neither post-op care nor a doctor visit — surfaces under 'All' only.
+    category: '',
+    provider_type: NURSE,
     duration: '1 hr',
     imageUrl: null,
     status: 'active',
@@ -82,7 +103,9 @@ const seedDocs = [
     title: 'Lab sample collection',
     price: 500,
     description: 'Phlebotomist collects blood / urine samples at your doorstep.',
-    category: 'Diagnostics',
+    // Neither post-op care nor a doctor visit — surfaces under 'All' only.
+    category: '',
+    provider_type: LAB_TECH,
     duration: '20 min',
     imageUrl: null,
     status: 'active',
@@ -217,6 +240,58 @@ async function run() {
   }
 
   console.log(`[seed] services: inserted=${inserted} skipped=${skipped} total=${seedDocs.length}`);
+
+  // Category self-heal. The upserts above use $setOnInsert / findOne guards,
+  // so editing a `category` literal in seedDocs does nothing to a database
+  // that already has the row — every dev machine would keep its pre-migration
+  // vocabulary ('Recovery', 'Consultation', …) and both patient Home chips
+  // would come up empty. Sweep every service, not just the seeded ones, so a
+  // plain `npm run seed` is enough to unblock local work without also running
+  // scripts/normalizeServiceCategories.js. updateOne (not doc.save) so legacy
+  // rows skip full-document validation on their way to being fixed.
+  const allServices = await Service.find().select('_id category').lean();
+  const fixes = [];
+  for (const s of allServices) {
+    const next = normalizeServiceCategory(s.category);
+    if (next !== String(s.category ?? '')) fixes.push({ _id: s._id, next });
+  }
+  if (fixes.length) {
+    await Service.bulkWrite(
+      fixes.map((f) => ({
+        updateOne: { filter: { _id: f._id }, update: { $set: { category: f.next } } },
+      }))
+    );
+  }
+  console.log(`[seed] service categories normalized: ${fixes.length}`);
+
+  // Provider-type self-heal, for the same reason as the category sweep above:
+  // $setOnInsert means an existing dev database never picks up the
+  // `provider_type` literals added to seedDocs, and every booking made from an
+  // untagged service falls back to nursing wording on the patient tracker.
+  // Only fills rows that carry NOTHING — an admin's explicit tag is never
+  // overwritten. Production should run scripts/backfillProviderTypes.js
+  // instead, which reports before it writes.
+  const untagged = await Service.find({
+    $or: [{ provider_type: null }, { provider_type: { $exists: false } }],
+  })
+    .select('_id title category')
+    .lean();
+  const typeFixes = [];
+  for (const s of untagged) {
+    const next = inferProviderType(s.title, s.category);
+    if (next) typeFixes.push({ _id: s._id, next });
+  }
+  if (typeFixes.length) {
+    await Service.bulkWrite(
+      typeFixes.map((f) => ({
+        updateOne: {
+          filter: { _id: f._id },
+          update: { $set: { provider_type: f.next } },
+        },
+      }))
+    );
+  }
+  console.log(`[seed] service provider types backfilled: ${typeFixes.length}`);
 
   // Promo banners — upsert by title so re-running stays idempotent.
   let banners = 0;

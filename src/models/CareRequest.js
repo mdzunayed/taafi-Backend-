@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 const { roundMoney } = require('../utils/money');
+const { describeMilestone } = require('../utils/bookingMilestones');
+const { PROVIDER_TYPES } = require('../utils/providerTypes');
 
 // `care_requests` collection. Field names are snake_case to match the
 // Flutter snake_case_json parser layer exactly (no camelCase drift). The
@@ -11,6 +13,27 @@ const CareRequestSchema = new mongoose.Schema(
     patient_account_id: { type: String, default: '', index: true },
     patient_phone: { type: String, default: '' },
     care_type: { type: String, required: true }, // free-text, e.g. "Post-surgery home care"
+    // The catalog row the patient booked from, when they came through the
+    // service catalog (free-text `care_type` alone can't be joined back).
+    // String id, matching the `assigned_*_id` convention above — the joins in
+    // utils/doctorView.js are manual, not Mongoose refs.
+    service_id: { type: String, default: null },
+    // WHO attends this booking. Copied from the booked Service at creation
+    // time and re-derived from the assigned provider's role at serialize time
+    // (utils/bookingMilestones.js), because the admin can dispatch a doctor to
+    // a booking the catalog tagged as nursing care.
+    //
+    // Drives every role-dependent string the patient sees: four of the six
+    // tracker steps, the provider card's role badge and registration label,
+    // and the pre-arrival preparation tip. `null` = never tagged; the resolver
+    // falls back to inferring from `care_type` and finally to NURSE, so the
+    // effective default matches the majority of the catalog without pretending
+    // a legacy row was explicitly tagged as nursing.
+    provider_type: {
+      type: String,
+      enum: [...PROVIDER_TYPES, null],
+      default: null,
+    },
     offered_budget: { type: Number, default: 0 },
     preferred_time: { type: String, default: null }, // ISO-8601 string or null (ASAP)
     duration_hours: { type: Number, default: 1 },
@@ -143,6 +166,46 @@ const CareRequestSchema = new mongoose.Schema(
     assigned_helper_id: { type: String, default: null },
     assigned_helper_name: { type: String, default: null },
 
+    // --- Patient-facing provider snapshot ---------------------------------
+    // Everything the tracking screen's Assigned Provider card needs, frozen
+    // at dispatch time: who is coming, how to reach them, and the credential
+    // that proves they are who the app says they are.
+    //
+    // Denormalised on purpose. `assigned_doctor_id` / `assigned_nurse_id` are
+    // free-form Strings that may point at either a `providers` or an
+    // `accounts` row (see utils/doctorView.js), so there is no single ref to
+    // populate; and a booking's record of who attended must survive the
+    // provider later editing their phone or leaving the platform. The read
+    // path in doctorView.js re-resolves the live provider and prefers its
+    // current photo/phone, falling back to this snapshot — so the card is
+    // fresh while the audit trail stays intact.
+    //
+    // Written by the admin dispatch routes. Every field stays null until an
+    // assignment happens; the card only renders once `name` is present.
+    assigned_provider: {
+      // Whichever id the admin dispatched — a Provider _id in practice, an
+      // Account _id for older rows. Resolved via `loadProviderPair`.
+      provider_id: { type: mongoose.Schema.Types.ObjectId, default: null },
+      // Role of THIS provider, which can differ from the booking's
+      // `provider_type` (a nursing booking can be escalated to a doctor).
+      provider_type: {
+        type: String,
+        enum: [...PROVIDER_TYPES, null],
+        default: null,
+      },
+      name: { type: String, default: null },
+      photo_url: { type: String, default: null },
+      phone: { type: String, default: null },
+      // Free text as it should read on the card, e.g. "Senior Care Nurse",
+      // "General Physician". Sourced from the provider's specialisation /
+      // degrees — never invented when the profile is blank.
+      designation: { type: String, default: null },
+      // BMDC / Nursing Council registration number. The label that precedes
+      // it on the card comes from `provider_type` (utils/providerTypes.js).
+      registration_no: { type: String, default: null },
+      assigned_at: { type: Date, default: null },
+    },
+
     // --- Provider acceptance gate -----------------------------------------
     // Explicit acceptance state, DECOUPLED from the lifecycle `status`
     // above. Admin dispatch sets this to PENDING_PROVIDER_ACCEPTANCE the
@@ -172,6 +235,35 @@ const CareRequestSchema = new mongoose.Schema(
       type: String,
       enum: ['low', 'medium', 'high', 'critical'],
       default: 'medium',
+    },
+
+    // --- Patient-facing milestone tracker ---------------------------------
+    // The appointment window the ADMIN commits to when confirming the
+    // booking ("Today at 3:30 PM"). Distinct from `preferred_time`, which is
+    // what the PATIENT asked for at booking time — the tracker shows this
+    // one, falling back to `preferred_time` until an admin sets it.
+    scheduled_time: { type: Date, default: null },
+
+    // Display name for the person actually attending, shown on the ongoing
+    // care card. Usually mirrors `assigned_doctor_name` / `assigned_nurse_name`,
+    // but stays writable so an admin can name a provider (e.g. an agency
+    // nurse) who has no Provider record yet.
+    assigned_provider_name: { type: String, default: null },
+
+    // Append-only audit of patient-visible milestone transitions:
+    // `status` holds the MILESTONE key (REQUESTED … COMPLETED / CANCELLED),
+    // not the canonical lifecycle status, because this feeds the tracking
+    // timeline. See utils/bookingMilestones.js.
+    status_history: {
+      type: [
+        {
+          _id: false,
+          status: { type: String, required: true },
+          timestamp: { type: Date, default: Date.now },
+          note: { type: String, default: null },
+        },
+      ],
+      default: [],
     },
 
     // Server timestamp stamped by `PATCH /api/appointments/:id/update-status`
@@ -291,6 +383,11 @@ CareRequestSchema.set('toJSON', {
   transform: (_doc, ret) => {
     ret.id = ret._id.toString();
     delete ret._id;
+    // Derive the patient-facing tracker block (milestone key, step N of 6,
+    // label, formatted schedule, and the full six-step timeline) from the
+    // canonical status. Additive — every existing consumer ignores it, and
+    // the patient app reads it instead of re-implementing the mapping.
+    Object.assign(ret, describeMilestone(ret));
     return ret;
   },
 });

@@ -195,6 +195,13 @@ app.use('/api/doctor', doctorRouter);
 // Canonical appointment surface — same domain as care_requests, just
 // under the spec's `/api/appointments/*` URL contract.
 app.use('/api/appointments', appointmentsRouter);
+// `/api/bookings/*` is the patient-facing name for the same rows — the app
+// talks about bookings, the provider apps about appointments, and the tracker
+// spec asks for `GET /api/bookings/:id`. Mounted as an alias rather than a
+// second router so the two can never drift: the response (including the
+// populated `assigned_provider` contact block and the role-aware milestone
+// labels) is byte-identical.
+app.use('/api/bookings', appointmentsRouter);
 // User-shaped surface — currently just the avatar upload endpoint;
 // future profile-photo-related routes (delete avatar, etc.) live here.
 app.use('/api/users', usersRouter);

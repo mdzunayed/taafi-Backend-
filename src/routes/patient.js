@@ -2,6 +2,11 @@ const express = require('express');
 const mongoose = require('mongoose');
 const CareRequest = require('../models/CareRequest');
 const Account = require('../models/Account');
+const Service = require('../models/Service');
+const {
+  normalizeProviderType,
+  inferProviderType,
+} = require('../utils/providerTypes');
 const { attachDoctorToRequest, loadProviderPair } = require('../utils/doctorView');
 const {
   releasePrescriptionsForSettledBooking,
@@ -78,6 +83,32 @@ function pickPatientFields(body) {
 
 const TERMINAL = ['completed', 'cancelled', 'rejected'];
 
+// One-active-booking rule. A patient may hold exactly one non-terminal
+// CareRequest at a time; the next one is only creatable once the current
+// booking reaches `completed` / `cancelled` / `rejected`.
+//
+// "Active" is defined as `status NOT IN TERMINAL` — the same predicate
+// `GET /requests/active` and `GET /home` use to pick the booking the app
+// renders in its Ongoing-care card. Keeping the two in lockstep is what
+// makes the client guard honest: anything the patient can SEE as ongoing
+// is exactly what blocks a new request here. That deliberately includes
+// `awaiting_deposit`, i.e. a booking created but never paid for — those
+// still occupy the tracker, so letting them stack would reintroduce the
+// duplicate bookings this guard exists to prevent. The escape hatch is
+// `POST /requests/:id/cancel`, which accepts `awaiting_deposit` precisely
+// so an abandoned deposit can't lock a patient out permanently.
+const ACTIVE_BOOKING_MESSAGE =
+  'You currently have an active booking in progress. Please wait until your ' +
+  'current session is completed or cancelled before requesting a new service.';
+
+async function findActiveBooking(accountId) {
+  if (!accountId) return null;
+  return CareRequest.findOne({
+    patient_account_id: String(accountId),
+    status: { $nin: TERMINAL },
+  }).sort({ created_at: -1 });
+}
+
 // Derive a coarse area from free-text location ("House 42, Dhanmondi" -> "Dhanmondi").
 function areaFromLocation(location) {
   if (!location) return '';
@@ -120,8 +151,35 @@ function pickCareRecipient(raw) {
   };
 }
 
-// POST /patient/requests — create a care request. Returns 201 + the row.
-router.post('/requests', async (req, res) => {
+// Resolve WHO will attend this booking, at creation time.
+//
+// The booked catalog row is the authority — that is where the admin tags a
+// service as doctor / nurse / physiotherapist / lab-tech work. When the
+// client didn't send a `service_id` (or the row is untagged) we fall back to
+// reading the service title and the free-text `care_type`, and finally to
+// null, which lets the tracker's own resolver decide rather than freezing a
+// guess onto the booking. Never throws: a lookup failure must not block a
+// booking, it only costs the tracker its role-specific wording.
+async function resolveBookingProviderType({ serviceId, careType }) {
+  let service = null;
+  if (serviceId && mongoose.isValidObjectId(serviceId)) {
+    try {
+      service = await Service.findById(serviceId).lean();
+    } catch (_) {
+      /* best-effort: an unreachable catalog must not fail the booking */
+    }
+  }
+  return (
+    normalizeProviderType(service && service.provider_type) ||
+    inferProviderType(service && service.title, service && service.category) ||
+    inferProviderType(careType)
+  );
+}
+
+// POST /patient/requests — create a care request. Returns 201 + the row,
+// or 409 when the caller already holds an active booking (see the
+// one-active-booking rule above).
+router.post('/requests', attachAccountId, async (req, res) => {
   try {
     const b = req.body || {};
     if (!b.patient_name || !String(b.patient_name).trim()) {
@@ -131,11 +189,45 @@ router.post('/requests', async (req, res) => {
       return res.status(400).json({ message: 'care_type is required' });
     }
 
+    // Prefer the verified identity from the bearer token over the body's
+    // `patient_account_id`, which is client-controlled and could otherwise
+    // be swapped to a stranger's id to sidestep the duplicate-booking
+    // check. The body value is only a fallback for the legacy unauthenticated
+    // callers this route has always accepted.
+    const accountId = req.accountId || b.patient_account_id || '';
+
+    // One active booking per patient. Skipped when we can't attribute the
+    // request to an account at all — there is nothing to scope the lookup to,
+    // and an unscoped query would block every patient off one stranger's
+    // in-flight booking.
+    const existing = await findActiveBooking(accountId);
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: ACTIVE_BOOKING_MESSAGE,
+        active_request_id: existing.id,
+        active_request_status: existing.status,
+      });
+    }
+
+    const serviceId = b.service_id || b.serviceId || null;
+    const providerType =
+      normalizeProviderType(b.provider_type || b.providerType) ||
+      (await resolveBookingProviderType({
+        serviceId,
+        careType: b.care_type,
+      }));
+
     const doc = await CareRequest.create({
       patient_name: String(b.patient_name).trim(),
-      patient_account_id: b.patient_account_id || '',
+      patient_account_id: accountId,
       patient_phone: b.patient_phone || '',
       care_type: String(b.care_type).trim(),
+      // The catalog row this booking came from, and who it says attends —
+      // both drive the patient tracker's role-aware wording. Null when the
+      // booking was created outside the catalog flow.
+      service_id: serviceId ? String(serviceId) : null,
+      provider_type: providerType,
       offered_budget: Number(b.offered_budget) || 0,
       preferred_time: b.preferred_time || null,
       duration_hours: Number(b.duration_hours) || 1,
@@ -167,6 +259,17 @@ router.post('/requests', async (req, res) => {
 // further), the patient can no longer pull it back unilaterally. Implemented
 // as an atomic compare-and-swap guarded on the pre-assignment states so a
 // cancel racing an admin assignment can't strand the request in a bad state.
+//
+// `awaiting_deposit` is cancellable for a reason: the one-active-booking rule
+// on POST /requests counts it as active, so without this a patient who
+// created a booking and then abandoned the ৳100 deposit would be locked out
+// of booking anything, forever, with no self-serve way out. Nothing is at
+// stake in that state — no money has moved and the booking never reached the
+// admin triage queue — so letting the patient drop it is free. States where
+// the deposit HAS cleared stay non-cancellable here; those involve a refund
+// decision and are the admin's call.
+const PATIENT_CANCELLABLE = ['awaiting_deposit', 'submitted', 'approved'];
+
 router.post('/requests/:id/cancel', async (req, res) => {
   try {
     const { id } = req.params;
@@ -179,7 +282,7 @@ router.post('/requests/:id/cancel', async (req, res) => {
         : '';
 
     const cancelled = await CareRequest.findOneAndUpdate(
-      { _id: id, status: { $in: ['submitted', 'approved'] } },
+      { _id: id, status: { $in: PATIENT_CANCELLABLE } },
       {
         $set: {
           status: 'cancelled',

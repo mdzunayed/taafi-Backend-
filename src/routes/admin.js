@@ -11,6 +11,7 @@ const {
   loadDoctorPair,
   loadProviderPair,
   attachDoctorToRequest,
+  buildAssignedProvider,
   withDoctorBlocks,
 } = require('../utils/doctorView');
 const {
@@ -32,7 +33,16 @@ const {
   lockBookingChannel,
   unlockBookingChannel,
 } = require('../utils/bookingFlow');
+const {
+  MILESTONES,
+  MILESTONE_BY_STATUS,
+  isValidMilestone,
+  statusForMilestone,
+  statusHistoryEntry,
+  formatSchedule,
+} = require('../utils/bookingMilestones');
 const { haversineKm, readLatLng } = require('../utils/geo');
+const { providerTypeFromRole } = require('../utils/providerTypes');
 const adminController = require('../controllers/admin.controller');
 const adminFinanceController = require('../controllers/adminFinanceController');
 
@@ -729,6 +739,18 @@ router.post('/requests/:id/cancel', requireRole('admin'), async (req, res) => {
           assigned_nurse_name: null,
           assigned_helper_id: null,
           assigned_helper_name: null,
+          // The patient must not be left with a call/WhatsApp card for a
+          // provider who is no longer coming. Cleared leaf by leaf:
+          // `assigned_provider` is a nested path, not a sub-schema, so
+          // nulling the parent would be cast against the object shape.
+          'assigned_provider.provider_id': null,
+          'assigned_provider.provider_type': null,
+          'assigned_provider.name': null,
+          'assigned_provider.photo_url': null,
+          'assigned_provider.phone': null,
+          'assigned_provider.designation': null,
+          'assigned_provider.registration_no': null,
+          'assigned_provider.assigned_at': null,
         },
       },
       { new: false },
@@ -827,6 +849,38 @@ router.post('/requests/:id/cancel', requireRole('admin'), async (req, res) => {
   }
 });
 
+// Freeze the patient-facing provider snapshot at dispatch time.
+//
+// The tracking screen's Assigned Provider card calls and WhatsApps this
+// person directly, so the booking has to carry the contact details itself
+// rather than depending on a provider row that can be edited or deactivated
+// afterwards. A dual team is led by the doctor — they are who the patient
+// coordinates arrival and directions with — so the doctor's pair wins.
+//
+// Returns `undefined` when neither pair resolved to a real record, which
+// leaves whatever snapshot the booking already had untouched.
+function assignedProviderPatch({ doctorPair, nursePair }) {
+  const lead =
+    (doctorPair && (doctorPair.provider || doctorPair.account) && doctorPair) ||
+    (nursePair && (nursePair.provider || nursePair.account) && nursePair) ||
+    null;
+  if (!lead) return undefined;
+
+  const role =
+    (lead.provider && lead.provider.role) ||
+    (lead.account && lead.account.role) ||
+    (lead === doctorPair ? 'doctor' : 'nurse');
+
+  const snapshot = buildAssignedProvider({
+    provider: lead.provider,
+    account: lead.account,
+    stored: null,
+    providerType: providerTypeFromRole(role),
+  });
+  if (!snapshot) return undefined;
+  return { ...snapshot, assigned_at: new Date() };
+}
+
 // POST /admin/requests/:id/assign
 //   { doctor_id, doctor_name, helper_id?, helper_name?,
 //     nurse_id?, nurse_name?, final_price?,
@@ -864,12 +918,34 @@ router.post('/requests/:id/assign', requireRole('admin'), async (req, res) => {
     const prevDoctorId = (existing.assigned_doctor_id || '').toString();
     const prevNurseId = (existing.assigned_nurse_id || '').toString();
 
+    // Resolved before the write so the patient-facing provider snapshot
+    // (name/photo/phone/registration) lands in the SAME atomic update as the
+    // assignment itself — a booking must never be `assigned` with a card the
+    // patient can't call.
+    const [doctorPair, nursePair] = await Promise.all([
+      b.doctor_id
+        ? loadProviderPair(b.doctor_id, 'doctor')
+        : Promise.resolve({ provider: null, account: null }),
+      b.nurse_id
+        ? loadProviderPair(b.nurse_id, 'nurse')
+        : Promise.resolve({ provider: null, account: null }),
+    ]);
+
     const update = {
       status: 'assigned',
       // Dispatch opens the provider acceptance gate — the assigned
       // doctor/nurse must Accept before the visit advances to `enroute`.
       acceptance_status: 'PENDING_PROVIDER_ACCEPTANCE',
     };
+    const providerSnapshot = assignedProviderPatch({ doctorPair, nursePair });
+    if (providerSnapshot) {
+      update.assigned_provider = providerSnapshot;
+      // The role the patient's tracker words its steps with follows whoever is
+      // actually coming, overriding the type the booked service carried.
+      if (providerSnapshot.provider_type) {
+        update.provider_type = providerSnapshot.provider_type;
+      }
+    }
     if (b.doctor_id) {
       update.assigned_doctor_id = b.doctor_id;
       update.assigned_doctor_name = b.doctor_name || null;
@@ -920,10 +996,6 @@ router.post('/requests/:id/assign', requireRole('admin'), async (req, res) => {
       });
     }
 
-    const [doctorPair, nursePair] = await Promise.all([
-      b.doctor_id ? loadProviderPair(b.doctor_id, 'doctor') : Promise.resolve({ provider: null, account: null }),
-      b.nurse_id ? loadProviderPair(b.nurse_id, 'nurse') : Promise.resolve({ provider: null, account: null }),
-    ]);
     await notifyAssignment(
       req.app.get('io'),
       result,
@@ -936,7 +1008,9 @@ router.post('/requests/:id/assign', requireRole('admin'), async (req, res) => {
     // Assignment IS approval — open the patient↔provider communication
     // channel now that a team is dispatched.
     await unlockBookingChannel(req.app.get('io'), result);
-    res.json(result.toJSON());
+    // Same populated shape the patient's tracker reads, so the assigning
+    // admin can confirm the provider card resolved (photo, phone, licence).
+    res.json(await attachDoctorToRequest(result.toJSON()));
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -1019,6 +1093,13 @@ router.post('/appointments/assign', requireRole('admin'), async (req, res) => {
       // Dispatch opens the provider acceptance gate (see /requests/:id/assign).
       acceptance_status: 'PENDING_PROVIDER_ACCEPTANCE',
     };
+    const providerSnapshot = assignedProviderPatch({ doctorPair, nursePair });
+    if (providerSnapshot) {
+      update.assigned_provider = providerSnapshot;
+      if (providerSnapshot.provider_type) {
+        update.provider_type = providerSnapshot.provider_type;
+      }
+    }
     if (doctorId) {
       update.assigned_doctor_id = doctorId;
       update.assigned_doctor_name = doctorName;
@@ -1318,6 +1399,192 @@ router.post('/requests/bulk-status', requireRole('admin'), async (req, res) => {
       { status }
     );
     res.json({ updated: result.modifiedCount ?? 0 });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PATCH /api/admin/bookings/:id/status
+//   { milestone?, status?, scheduled_time?, assigned_provider_name?, note? }
+//
+// The admin-side driver for the patient's step-by-step tracker. Accepts a
+// patient-facing MILESTONE key (REQUESTED … COMPLETED / CANCELLED) and maps
+// it onto the canonical lifecycle `status` — see utils/bookingMilestones.js
+// for why the two vocabularies are kept apart. A raw canonical `status` is
+// also accepted so existing admin tooling can call this endpoint directly.
+//
+// Every accepted call:
+//   1. writes the canonical status (guarded — terminal bookings stay closed),
+//   2. sets/edits the admin-committed `scheduled_time` and provider name,
+//   3. appends a `status_history` row for the timeline,
+//   4. opens/closes the patient↔provider channel to match the new phase, and
+//   5. broadcasts `booking:status_updated` + a push so the card re-renders
+//      without a manual refresh.
+router.patch('/bookings/:id/status', requireRole('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: 'Invalid booking id' });
+    }
+
+    const b = req.body || {};
+    const rawMilestone = (b.milestone || '').toString().trim().toUpperCase();
+    const rawStatus = (b.status || '').toString().trim().toLowerCase();
+
+    // Resolve the target milestone from either vocabulary.
+    let milestoneKey = null;
+    if (rawMilestone) {
+      if (!isValidMilestone(rawMilestone)) {
+        return res.status(400).json({
+          message: `milestone must be one of: ${[...MILESTONES.map((m) => m.key), 'CANCELLED'].join(', ')}`,
+        });
+      }
+      milestoneKey = rawMilestone;
+    } else if (rawStatus) {
+      if (!MILESTONE_BY_STATUS[rawStatus]) {
+        return res.status(400).json({ message: `Unknown status "${rawStatus}"` });
+      }
+      milestoneKey = MILESTONE_BY_STATUS[rawStatus];
+    }
+
+    // Optional schedule edit — an explicit null clears it.
+    let scheduledTime;
+    const rawSchedule =
+      b.scheduled_time !== undefined ? b.scheduled_time : b.scheduledTime;
+    if (rawSchedule !== undefined) {
+      if (rawSchedule === null || rawSchedule === '') {
+        scheduledTime = null;
+      } else {
+        const parsed = new Date(rawSchedule);
+        if (Number.isNaN(parsed.getTime())) {
+          return res
+            .status(400)
+            .json({ message: 'scheduled_time must be a valid date' });
+        }
+        scheduledTime = parsed;
+      }
+    }
+
+    const rawProvider =
+      b.assigned_provider_name !== undefined
+        ? b.assigned_provider_name
+        : b.assignedProviderName;
+
+    if (milestoneKey === null && scheduledTime === undefined && rawProvider === undefined) {
+      return res.status(400).json({
+        message:
+          'Nothing to update — supply milestone, status, scheduled_time or assigned_provider_name.',
+      });
+    }
+
+    const update = {};
+    if (milestoneKey) {
+      // A raw canonical status is written through verbatim so callers can
+      // reach states the coarse milestone map collapses (e.g. `arrived`).
+      update.status =
+        rawStatus && MILESTONE_BY_STATUS[rawStatus]
+          ? rawStatus
+          : statusForMilestone(milestoneKey);
+    }
+    if (scheduledTime !== undefined) update.scheduled_time = scheduledTime;
+    if (rawProvider !== undefined) {
+      update.assigned_provider_name =
+        rawProvider === null ? null : rawProvider.toString().trim() || null;
+    }
+
+    // Atomic compare-and-swap guarded on the booking not already being
+    // terminal — a late or duplicated admin action can't reopen a closed
+    // visit. Schedule-only edits are held to the same rule.
+    const push = milestoneKey
+      ? { status_history: statusHistoryEntry(milestoneKey, b.note) }
+      : undefined;
+
+    const updated = await CareRequest.findOneAndUpdate(
+      { _id: id, status: { $nin: TERMINAL } },
+      push ? { $set: update, $push: push } : { $set: update },
+      { new: true, runValidators: true },
+    );
+
+    if (!updated) {
+      const exists = await CareRequest.exists({ _id: id });
+      return res.status(exists ? 409 : 404).json({
+        message: exists
+          ? 'This booking is already completed, cancelled or rejected.'
+          : 'Booking not found',
+      });
+    }
+
+    const io = req.app.get('io');
+
+    // Keep the communication channel consistent with the new phase. Both
+    // helpers are best-effort and must never fail the transition above.
+    if (milestoneKey) {
+      if (['SCHEDULED', 'EN_ROUTE', 'IN_SERVICE'].includes(milestoneKey)) {
+        await unlockBookingChannel(io, updated);
+      } else if (['COMPLETED', 'CANCELLED'].includes(milestoneKey)) {
+        await lockBookingChannel(io, updated);
+      }
+    }
+
+    const body = await attachDoctorToRequest(updated.toJSON());
+    const patientId = updated.patient_account_id;
+
+    if (patientId) {
+      const apptId = updated._id.toString();
+      const when = formatSchedule(updated.scheduled_time);
+      const payload = {
+        appointmentId: apptId,
+        requestId: apptId,
+        milestone: body.milestone,
+        milestoneStep: body.milestone_step,
+        milestoneTotal: body.milestone_total,
+        scheduledTime: updated.scheduled_time
+          ? updated.scheduled_time.toISOString()
+          : null,
+        scheduledTimeLabel: when,
+        deepLink: 'tracking',
+      };
+
+      // Only announce an actual milestone move. A quiet schedule edit still
+      // broadcasts below (so the time pill refreshes) but doesn't push.
+      if (milestoneKey) {
+        const title = body.milestone_label || 'Booking update';
+        const bodyText = when
+          ? `${updated.care_type || 'Your booking'} · ${when}`
+          : `${updated.care_type || 'Your booking'} — tap to view your tracker.`;
+        try {
+          await safeEmitNotification(io, {
+            recipientId: patientId,
+            senderId: null,
+            title,
+            body: bodyText,
+            type: 'appointment',
+            payload,
+          });
+          // eslint-disable-next-line no-floating-promises
+          sendHighPriorityPush(patientId, title, bodyText, {
+            click_action: 'FLUTTER_NOTIFICATION_CLICK',
+            appointmentId: apptId,
+            deepLink: 'tracking',
+          });
+        } catch (_) {
+          /* notification failure must not fail the committed transition */
+        }
+      }
+
+      if (io) {
+        try {
+          // Patient's personal room drives the home card; the booking room
+          // drives any open tracking screen (patient AND assigned provider).
+          io.to(userRoomFor(patientId)).emit('booking:status_updated', payload);
+          io.to(apptId).emit('booking:status_updated', payload);
+        } catch (_) {
+          /* live fan-out is best-effort */
+        }
+      }
+    }
+
+    res.json(body);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

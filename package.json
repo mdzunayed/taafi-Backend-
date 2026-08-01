@@ -13,7 +13,9 @@
     "dev": "nodemon src/server.js",
     "worker": "node src/queues/worker.js",
     "loadtest": "node tests/load_test.js",
-    "seed": "node src/seed.js"
+    "seed": "node src/seed.js",
+    "migrate:categories": "node scripts/normalizeServiceCategories.js",
+    "migrate:provider-types": "node scripts/backfillProviderTypes.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
