@@ -11,10 +11,15 @@ const { Server: SocketIOServer } = require('socket.io');
 const servicesRouter = require('./routes/services');
 const promoBannersRouter = require('./routes/promoBanners');
 const homeSectionsRouter = require('./routes/homeSections');
+const categoriesRouter = require('./routes/categories');
+const homeDataRouter = require('./routes/homeData');
 const appOpenAdRouter = require('./routes/appOpenAd');
+const configRouter = require('./routes/config');
+const pricingService = require('./services/pricingService');
 const authRouter = require('./routes/auth');
 const patientRouter = require('./routes/patient');
 const adminRouter = require('./routes/admin');
+const documentsRouter = require('./routes/documents');
 const doctorRouter = require('./routes/doctor');
 const appointmentsRouter = require('./routes/appointments');
 const usersRouter = require('./routes/users');
@@ -48,6 +53,8 @@ const { sniffImageMime } = require('./utils/imageMime');
 const cloudinary = require('./middleware/cloudinary');
 const publicUrl = require('./utils/publicUrl');
 const { uploadErrorHandler } = require('./middleware/uploadErrors');
+// Keeps patient medical documents out of the otherwise-public /uploads mount.
+const { blockPrivateUploads } = require('./middleware/privateUploads');
 // Production security stack (helmet + CORS allow-list + rate limiting) and
 // the NoSQL-injection sanitizer.
 const security = require('./middleware/security');
@@ -144,6 +151,7 @@ function uploadsCors(_req, res, next) {
 app.use(
   '/uploads',
   uploadsCors,
+  blockPrivateUploads,
   express.static(UPLOAD_DIR, {
     maxAge: '7d',
     setHeaders(res, filePath, stat) {
@@ -169,10 +177,23 @@ app.use('/api/promo-banners', promoBannersRouter);
 // Services. Public GET (the client reads active sections); all writes are
 // admin-gated inside the router via requireRole('admin').
 app.use('/api/home-sections', homeSectionsRouter);
+// Admin-managed filter pills on the patient Home chip rail. Public GET (the
+// rail renders before sign-in); all writes are admin-gated inside the router
+// via requireRole('admin').
+app.use('/api/categories', categoriesRouter);
+// One-shot patient Home payload: active categories + the Care Services block
+// (with its admin-chosen layout) + the dynamic sections below it. Public, and
+// read-only — every write goes through the routers above.
+app.use('/api/home-data', homeDataRouter);
 // Full-screen app-open interstitial ad. Public GET (the patient client
 // checks for an active campaign at launch); upsert/delete are admin-gated
 // inside the router via requireRole('admin').
 app.use('/api/app-open-ad', appOpenAdRouter);
+// Public client configuration (currently just the booking deposit). Both
+// prefixes, same as patient/admin/doctor/provider, so a client on either base
+// URL can read it. Unauthenticated by design — see routes/config.js.
+app.use('/api/config', configRouter);
+app.use('/config', configRouter);
 // Auth is exposed under both prefixes:
 //   • `/auth/*`     — legacy. The existing DioClient + legacy LoginScreen.
 //   • `/api/auth/*` — canonical (matches the new spec).
@@ -181,11 +202,22 @@ app.use('/api/app-open-ad', appOpenAdRouter);
 app.use('/auth', authRouter);
 app.use('/api/auth', authRouter);
 app.use('/patient', patientRouter);
+// Spec-named alias, same treatment auth/admin/doctor/provider already get:
+// every patient route (including POST /patient/documents) answers on both
+// `/patient/*` and `/api/patient/*`, so a client configured with an `/api`
+// base URL doesn't get "endpoint not found".
+app.use('/api/patient', patientRouter);
 app.use('/admin', adminRouter);
 // Spec-named alias — every admin route is reachable under both
 // `/admin/*` and `/api/admin/*`. The new POST /api/admin/appointments/
 // assign endpoint lives here.
 app.use('/api/admin', adminRouter);
+// Patient medical documents, addressed by presigned grant. Role-neutral by
+// design: both the admin assignment console and the assigned doctor/nurse
+// console open the same records, and the grant in the path is the credential
+// (the mint-time check upstream is what decides who ever holds one). Also
+// reachable at the legacy `/admin/documents/:token` for grants already issued.
+app.use('/api/documents', documentsRouter);
 app.use('/doctor', doctorRouter);
 // Spec-named alias. Every doctor route is reachable under both
 // prefixes — `/doctor/profile-status` and `/api/doctor/profile-status`
@@ -202,6 +234,11 @@ app.use('/api/appointments', appointmentsRouter);
 // populated `assigned_provider` contact block and the role-aware milestone
 // labels) is byte-identical.
 app.use('/api/bookings', appointmentsRouter);
+// The clinician-facing name for the same rows. Exists so the provider consoles
+// can call `POST /api/clinician/bookings/:id/confirm-cash` — the cash half of
+// the dual prescription gate — under a URL that says who is acting, without a
+// second router that could drift from the appointment one.
+app.use('/api/clinician/bookings', appointmentsRouter);
 // User-shaped surface — currently just the avatar upload endpoint;
 // future profile-photo-related routes (delete avatar, etc.) live here.
 app.use('/api/users', usersRouter);
@@ -263,6 +300,14 @@ mongoose
   .connect(MONGO_URI)
   .then(async () => {
     console.log(`[mongo] connected to ${MONGO_URI}`);
+
+    // Resolve the configured booking deposit once up front. `projectInvoice`
+    // reads it synchronously (it runs inside a toJSON transform), so without
+    // this warm-up the first requests after boot would project the compiled-in
+    // default instead of the admin's configured amount.
+    await pricingService.warmPricingCache().catch((e) => {
+      console.warn('[pricing] cache warm-up failed:', e.message);
+    });
 
     // Self-heal: drop the legacy `email_1` unique index from the
     // `accounts` collection if it's still hanging around. It was added

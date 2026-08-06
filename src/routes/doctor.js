@@ -12,6 +12,9 @@ const {
   notifyPatientBalanceDue,
   lockBookingChannel,
 } = require('../utils/bookingFlow');
+// Patient-attached medical records, as presigned expiring grants. Minted only
+// after the assignment check on GET /bookings/:id — see the comment there.
+const { describeAttachments } = require('../utils/bookingAttachments');
 
 const router = express.Router();
 
@@ -301,6 +304,14 @@ router.get('/dashboard', async (req, res) => {
         location_text: o.location_text,
         status: o.status,                       // drives the doctor-side state machine
         payment_preference: o.payment_preference, // Cash-on-Service badge + mandatory collect
+        // Normalized balance posture (see utils/paymentPosture). The console
+        // seeds its payment card from these instead of inferring "cash?" from
+        // `payment_preference` alone — which is how a booking the patient had
+        // already paid online still rendered "Collect Cash · Required".
+        payment_channel: o.payment_channel,           // ONLINE | CASH
+        payment_status: o.payment_status,             // PAID | PENDING
+        remaining_balance: o.remaining_balance,
+        cash_collection_required: o.cash_collection_required,
         care_recipient: cr,                     // target patient snapshot (or null = self)
         patient_age_sex: cr ? ageSexLabel(cr.date_of_birth, cr.gender) : '',
       };
@@ -348,6 +359,78 @@ router.get('/dashboard', async (req, res) => {
       reviews: [],
       pending_assignment: null,
       upcoming_today: upcoming,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET /doctor/bookings/:id
+//
+// Authoritative booking detail for the assigned clinician's console — the
+// `fetchBookingDetails()` the Clinical Care Console calls whenever it is
+// handed a `booking:payment_updated` event (and on resume, when it may have
+// slept through one). The response ALWAYS carries the live payment block
+// (`payment_channel`, `payment_status`, `remaining_balance`,
+// `cash_collection_required`, plus the raw `payment_method` /
+// `payment_preference` it is derived from), so the console never has to
+// reason about staleness: whatever this returns is what it renders.
+//
+// It also carries `attachments` — the previous medical records (discharge
+// summaries, old prescriptions, lab reports) the patient attached at booking
+// time. A clinician walking into a post-surgery dressing change needs the
+// discharge summary at the door, and this is the only call their console
+// makes that is already scoped to the assignment.
+//
+// Scoped to the assignment — only this visit's doctor or nurse may read it,
+// matched across the clinician's full id set (Account + Provider) because
+// admin historically filed assignments under either. That check is what
+// authorizes the documents too: `describeAttachments` mints a presigned,
+// 30-minute grant per file, and the grant is the credential the delivery
+// route (routes/documents.js) accepts, so it must only ever be minted after
+// the caller has been proven to be the assigned clinician.
+router.get('/bookings/:id', requireAccountId, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: 'Invalid booking id' });
+    }
+    const doc = await CareRequest.findById(id);
+    if (!doc) return res.status(404).json({ message: 'Booking not found' });
+
+    const ids = await resolveProviderIds(req.accountId);
+    const idSet = new Set(ids.map(String));
+    const assigned =
+      idSet.has(String(doc.assigned_doctor_id || '')) ||
+      idSet.has(String(doc.assigned_nurse_id || ''));
+    if (!assigned) {
+      return res
+        .status(403)
+        .json({ message: 'You are not assigned to this booking.' });
+    }
+
+    const o = doc.toJSON();
+    res.json({
+      id: o.id,
+      status: o.status,
+      patient_name: o.patient_name,
+      patient_account_id: o.patient_account_id,
+      final_price: o.final_price,
+      deposit_amount: o.deposit_amount,
+      adjusted_discount: o.adjusted_discount,
+      // The payment block this endpoint exists for.
+      payment_method: o.payment_method,          // DIGITAL | CASH_TO_PROVIDER | null
+      payment_preference: o.payment_preference,  // DIGITAL | CASH_ON_SERVICE | null
+      payment_channel: o.payment_channel,        // ONLINE | CASH
+      payment_status: o.payment_status,          // PAID | PENDING
+      remaining_balance: o.remaining_balance,
+      cash_collection_required: o.cash_collection_required,
+      final_paid_at: o.final_paid_at,
+      collected_at: o.collected_at,
+      // Presigned, expiring descriptors — never the raw Cloudinary/uploads
+      // location. The response is a hand-picked whitelist, so `o.documents`
+      // is dropped by construction rather than by a delete.
+      attachments: describeAttachments(o.id, o.documents),
     });
   } catch (err) {
     res.status(500).json({ message: err.message });

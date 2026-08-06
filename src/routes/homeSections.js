@@ -33,6 +33,24 @@ const ITEM_SERVICE_POPULATE = {
   select: '_id title price category imageUrl status',
 };
 
+// Resolved alongside the service so the client can filter a card against the
+// Home pill rail without holding a second id→slug table. `slug` is the join
+// key; the names come along for the CMS list, which shows what a card is
+// tagged as without a lookup.
+const ITEM_CATEGORY_POPULATE = {
+  path: 'contentData.categoryId',
+  select: '_id slug nameEn nameBn',
+};
+
+const ITEM_POPULATE = [ITEM_SERVICE_POPULATE, ITEM_CATEGORY_POPULATE];
+
+// The one `sectionKey` the app treats specially: it is the Care Services block
+// on Home, so the patient renderer reads its `layoutType` and skips it in the
+// generic dynamic-sections list (otherwise it would render twice).
+const CARE_SERVICES_KEY = 'CARE_SERVICES';
+
+const LAYOUT_TYPES = DynamicSection.schema.path('layoutType').enumValues;
+
 const isHttp = (v) => /^https?:\/\//i.test(v || '');
 
 // Resolves an item's effective target for the wire, so clients never have to
@@ -83,12 +101,42 @@ function normalizeTarget(item) {
   };
 }
 
-function decorate(doc) {
+// Flattens a card's (possibly populated) `categoryId` into a plain id plus the
+// slug the client filters on. Mirrors `normalizeTarget`'s contract: the wire
+// always carries a scalar id, never "sometimes an id and sometimes an object",
+// with the resolved snapshot on its own key.
+function normalizeCategory(item) {
+  const raw = item.categoryId;
+  if (!raw) return { categoryId: null, categorySlug: null, category: null };
+  const id = String(raw._id || raw.id || raw);
+  // Unpopulated (a bare ObjectId) or a reference to a deleted category — the
+  // id still round-trips so the CMS doesn't drop the tag on the next save.
+  if (!raw.slug) return { categoryId: id, categorySlug: null, category: null };
+  return {
+    categoryId: id,
+    categorySlug: raw.slug,
+    category: {
+      id,
+      slug: raw.slug,
+      nameEn: raw.nameEn || '',
+      nameBn: raw.nameBn || null,
+    },
+  };
+}
+
+// `publicOnly` drops cards an admin has switched off, so the patient feed
+// never receives them; the admin console always sees the full array (that is
+// what makes a hidden card recoverable rather than deleted).
+function decorate(doc, { publicOnly = false } = {}) {
   const obj = doc.toJSON();
-  obj.contentData = (obj.contentData || []).map((item) => ({
+  const items = publicOnly
+    ? (obj.contentData || []).filter((item) => item.isActive !== false)
+    : (obj.contentData || []);
+  obj.contentData = items.map((item) => ({
     ...item,
     ...(item.imageUrl ? { imageUrl: toAbsolute(item.imageUrl) } : {}),
     ...normalizeTarget(item),
+    ...normalizeCategory(item),
   }));
   return obj;
 }
@@ -112,6 +160,14 @@ async function assertLinkedServicesExist(items) {
 function parseBool(raw, fallback) {
   if (raw === undefined || raw === null || raw === '') return fallback;
   return raw === true || raw === 'true' || raw === '1' || raw === 1;
+}
+
+// Trims an optional free-text card field to null when blank, so "cleared in
+// the CMS" and "never set" reach the client as the same absent value.
+function optionalText(raw) {
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  return s || null;
 }
 
 // The optional color-override keys, per level.
@@ -189,18 +245,47 @@ function sanitizeItems(raw) {
     const cardStyles = sanitizeTokens(
       item.cardStyles, CARD_STYLE_KEYS, `contentData[${i}].cardStyles`);
     const target = sanitizeTarget(item, `contentData[${i}]`);
+    const categoryId = sanitizeCategoryId(item, `contentData[${i}]`);
 
     return {
       itemId: item.itemId ? String(item.itemId) : String(i),
+      categoryId,
       title,
-      subtitle: item.subtitle ? String(item.subtitle) : null,
+      subtitle: optionalText(item.subtitle),
+      titleBn: optionalText(item.titleBn),
+      subtitleBn: optionalText(item.subtitleBn),
       imageUrl,
-      priceTag: item.priceTag ? String(item.priceTag) : null,
+      priceTag: optionalText(item.priceTag),
+      badgeText: optionalText(item.badgeText),
+      // Absent on payloads from admin builds predating per-card visibility;
+      // those cards must stay visible, so the fallback is `true`.
+      isActive: parseBool(item.isActive, true),
       ...target,
       routeArguments,
       ...(cardStyles ? { cardStyles } : {}),
     };
   });
+}
+
+// Reads a card's Home-pill tag off the request body. Absent, blank, and null
+// all mean "untagged" — the card then only shows under the implicit "All"
+// pill. Accepts a populated object as well as a bare id, so an admin can PUT
+// back a section exactly as it was read.
+//
+// Existence is deliberately NOT checked here: the tag is cosmetic (it decides
+// which pill a card hides behind), a deleted category already nulls its
+// references in routes/categories.js, and a hard failure would block saving an
+// unrelated text edit. Compare `assertLinkedServicesExist`, which does reject —
+// a dangling *service* link breaks the booking tap, which is not cosmetic.
+function sanitizeCategoryId(item, label) {
+  const raw = item.categoryId;
+  if (raw === undefined || raw === null || raw === '') return null;
+  const id = String(raw._id || raw.id || raw).trim();
+  if (!id) return null;
+  if (!mongoose.isValidObjectId(id)) {
+    throw new Error(`${label}.categoryId must be a valid category id`);
+  }
+  return id;
 }
 
 // Resolves one item's tap target from the request body into the four stored
@@ -270,13 +355,15 @@ const UI_TEMPLATES = DynamicSection.schema.path('uiTemplate').enumValues;
 router.get('/', async (req, res) => {
   try {
     const filter = {};
-    if (req.query.active === '1' || req.query.active === 'true') {
+    const publicOnly =
+      req.query.active === '1' || req.query.active === 'true';
+    if (publicOnly) {
       filter.isActive = true;
     }
     const docs = await DynamicSection.find(filter)
       .sort({ orderIndex: 1, createdAt: -1 })
-      .populate(ITEM_SERVICE_POPULATE);
-    res.json(docs.map(decorate));
+      .populate(ITEM_POPULATE);
+    res.json(docs.map((d) => decorate(d, { publicOnly })));
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -294,6 +381,10 @@ router.post('/', requireRole('admin'), async (req, res) => {
     }
     if (!UI_TEMPLATES.includes(uiTemplate)) {
       return res.status(400).json({ message: `uiTemplate must be one of: ${UI_TEMPLATES.join(', ')}` });
+    }
+    const layoutType = req.body.layoutType ?? req.body.layout_type;
+    if (layoutType !== undefined && !LAYOUT_TYPES.includes(layoutType)) {
+      return res.status(400).json({ message: `layoutType must be one of: ${LAYOUT_TYPES.join(', ')}` });
     }
 
     const key = String(sectionKey).trim();
@@ -327,13 +418,14 @@ router.post('/', requireRole('admin'), async (req, res) => {
       titleEn: String(titleEn).trim(),
       titleBn: req.body.titleBn ? String(req.body.titleBn).trim() : null,
       uiTemplate,
+      ...(layoutType !== undefined ? { layoutType } : {}),
       orderIndex: req.body.orderIndex !== undefined ? Number(req.body.orderIndex) : nextOrder,
       isActive: parseBool(req.body.isActive, true),
       contentData,
       ...(styleTokens ? { styleTokens } : {}),
     });
 
-    await doc.populate(ITEM_SERVICE_POPULATE);
+    await doc.populate(ITEM_POPULATE);
     res.status(201).json(decorate(doc));
   } catch (err) {
     if (err && err.code === 11000) {
@@ -357,7 +449,7 @@ router.patch('/reorder', requireRole('admin'), async (req, res) => {
     await DynamicSection.bulkWrite(ops);
     const docs = await DynamicSection.find()
       .sort({ orderIndex: 1, createdAt: -1 })
-      .populate(ITEM_SERVICE_POPULATE);
+      .populate(ITEM_POPULATE);
     res.json(docs.map(decorate));
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -385,6 +477,85 @@ router.post('/images', requireRole('admin'), upload.single('image'), async (req,
   }
 });
 
+// PUT /api/home-sections/care-services  { layoutType, titleEn?, titleBn? }
+// (admin) — upserts the reserved CARE_SERVICES section.
+//
+// Care Services is the one block on Home that predates the CMS: it has always
+// rendered the live `/api/services` catalog, so on an existing deployment
+// there is no document to PATCH a layout onto. Rather than make the admin
+// hand-create a section with a magic key before the layout selector works,
+// this creates it on first use and updates it thereafter.
+//
+// Declared above `/:id` — Express matches in order, and "care-services" is not
+// an ObjectId, so the reverse would 500 in the id cast instead of landing here.
+router.put('/care-services', requireRole('admin'), async (req, res) => {
+  try {
+    const layoutType = req.body.layoutType ?? req.body.layout_type;
+    if (layoutType !== undefined && !LAYOUT_TYPES.includes(layoutType)) {
+      return res.status(400).json({ message: `layoutType must be one of: ${LAYOUT_TYPES.join(', ')}` });
+    }
+
+    let doc = await DynamicSection.findOne({ sectionKey: CARE_SERVICES_KEY });
+    if (!doc) {
+      doc = new DynamicSection({
+        sectionKey: CARE_SERVICES_KEY,
+        titleEn: 'Care services',
+        titleBn: 'সেবা',
+        // Care Services renders through the app's own layout engine, not the
+        // generic template switch, but the field is `required` — so it is set
+        // to the template whose cards the engine actually draws.
+        uiTemplate: 'HORIZONTAL_PRODUCT_CARD',
+        // Care Services sits above every admin-created section on Home, and
+        // the patient renderer skips this document in the generic list, so the
+        // index only matters for the CMS's own ordering.
+        orderIndex: -1,
+        isActive: true,
+      });
+    }
+    if (layoutType !== undefined) doc.layoutType = layoutType;
+    if (req.body.titleEn !== undefined) {
+      const t = optionalText(req.body.titleEn);
+      if (!t) return res.status(400).json({ message: 'titleEn cannot be empty' });
+      doc.titleEn = t;
+    }
+    if (req.body.titleBn !== undefined) doc.titleBn = optionalText(req.body.titleBn);
+    if (req.body.isActive !== undefined) {
+      doc.isActive = parseBool(req.body.isActive, doc.isActive);
+    }
+
+    await doc.save();
+    await doc.populate(ITEM_POPULATE);
+    res.json(decorate(doc));
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PATCH /api/home-sections/:id/layout  { layoutType }  (admin)
+// The layout selector's write path for a section that already exists. Kept
+// separate from the whole-section PUT so switching a layout can't clobber
+// `contentData` from a stale editor — same reasoning as `/:id/status`.
+router.patch('/:id/layout', requireRole('admin'), async (req, res) => {
+  try {
+    const layoutType = req.body.layoutType ?? req.body.layout_type;
+    if (layoutType === undefined) {
+      return res.status(400).json({ message: 'layoutType is required' });
+    }
+    if (!LAYOUT_TYPES.includes(layoutType)) {
+      return res.status(400).json({ message: `layoutType must be one of: ${LAYOUT_TYPES.join(', ')}` });
+    }
+    const doc = await DynamicSection.findByIdAndUpdate(
+      req.params.id,
+      { layoutType },
+      { new: true }
+    ).populate(ITEM_POPULATE);
+    if (!doc) return res.status(404).json({ message: 'Section not found' });
+    res.json(decorate(doc));
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // PUT /api/home-sections/:id  (admin; JSON body, partial update;
 // contentData present ⇒ whole-array replace)
 router.put('/:id', requireRole('admin'), async (req, res) => {
@@ -406,6 +577,13 @@ router.put('/:id', requireRole('admin'), async (req, res) => {
       }
       doc.uiTemplate = uiTemplate;
     }
+    const layoutType = req.body.layoutType ?? req.body.layout_type;
+    if (layoutType !== undefined) {
+      if (!LAYOUT_TYPES.includes(layoutType)) {
+        return res.status(400).json({ message: `layoutType must be one of: ${LAYOUT_TYPES.join(', ')}` });
+      }
+      doc.layoutType = layoutType;
+    }
     if (req.body.orderIndex !== undefined) doc.orderIndex = Number(req.body.orderIndex);
     if (req.body.isActive !== undefined) doc.isActive = parseBool(req.body.isActive, doc.isActive);
     if (req.body.styleTokens !== undefined) {
@@ -426,7 +604,7 @@ router.put('/:id', requireRole('admin'), async (req, res) => {
     }
 
     await doc.save();
-    await doc.populate(ITEM_SERVICE_POPULATE);
+    await doc.populate(ITEM_POPULATE);
     res.json(decorate(doc));
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -444,8 +622,34 @@ router.patch('/:id/status', requireRole('admin'), async (req, res) => {
       req.params.id,
       { isActive },
       { new: true }
-    ).populate(ITEM_SERVICE_POPULATE);
+    ).populate(ITEM_POPULATE);
     if (!doc) return res.status(404).json({ message: 'Section not found' });
+    res.json(decorate(doc));
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PATCH /api/home-sections/:id/items/:itemId/status  { isActive }  (admin)
+// One-tap show/hide for a single card. Exists alongside the whole-section PUT
+// so flipping a card's visibility doesn't round-trip (and risk clobbering) the
+// entire contentData array from a stale editor.
+router.patch('/:id/items/:itemId/status', requireRole('admin'), async (req, res) => {
+  try {
+    if (req.body.isActive === undefined) {
+      return res.status(400).json({ message: 'isActive is required' });
+    }
+    const doc = await DynamicSection.findById(req.params.id);
+    if (!doc) return res.status(404).json({ message: 'Section not found' });
+
+    const item = (doc.contentData || []).find(
+      (i) => String(i.itemId) === String(req.params.itemId)
+    );
+    if (!item) return res.status(404).json({ message: 'Card not found' });
+
+    item.isActive = parseBool(req.body.isActive, true);
+    await doc.save();
+    await doc.populate(ITEM_POPULATE);
     res.json(decorate(doc));
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -471,3 +675,15 @@ router.delete('/:id', requireRole('admin'), async (req, res) => {
 });
 
 module.exports = router;
+
+// The reserved key, shared with routes/homeData.js so the two agree on which
+// section is the Care Services block.
+module.exports.CARE_SERVICES_KEY = CARE_SERVICES_KEY;
+module.exports.ITEM_POPULATE = ITEM_POPULATE;
+module.exports.decorate = decorate;
+
+// Exposed for tests/homeSectionCards.test.js. These two pure transforms decide
+// what an admin's payload becomes on disk and what the patient feed is allowed
+// to see — the parts worth pinning without standing up a database.
+module.exports._sanitizeItems = sanitizeItems;
+module.exports._decorate = decorate;

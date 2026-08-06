@@ -277,6 +277,44 @@ async function toggleProviderVerification(req, res) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// PATCH /api/admin/providers/:id/status   { status: 'active' | 'suspended' }
+//
+// Account gate, orthogonal to verification. Suspending withholds a provider
+// from dispatch matching without touching their credentials or verified
+// badge, so reinstating restores the previous state exactly. Body is
+// explicit rather than a toggle — the Providers table can be stale, and a
+// blind flip on a stale row would reinstate someone an admin meant to keep
+// suspended.
+// ───────────────────────────────────────────────────────────────────────────
+async function setProviderStatus(req, res) {
+  try {
+    const next = (req.body?.status || '').toString().trim();
+    if (next !== 'active' && next !== 'suspended') {
+      return res.status(400).json({
+        success: false,
+        message: "status must be 'active' or 'suspended'",
+      });
+    }
+    const provider = await Provider.findById(req.params.id);
+    if (!provider) {
+      return res
+        .status(404)
+        .json({ success: false, message: 'Provider not found' });
+    }
+    provider.status = next;
+    // A suspended provider must not keep advertising availability, or the
+    // matcher's online filter would still surface them.
+    if (next === 'suspended') provider.availability_status = 'offline';
+    await provider.save();
+    res.json({ success: true, provider: provider.toJSON() });
+  } catch (err) {
+    res
+      .status(500)
+      .json({ success: false, message: err.message || 'Server error' });
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // POST /api/admin/register-sub-admin   { name, email, password, phone? }
 //
 // Root-admin-only creation of a secondary admin account. The route guard
@@ -356,5 +394,6 @@ module.exports = {
   getDashboardTelemetry,
   getLiveServices,
   toggleProviderVerification,
+  setProviderStatus,
   registerSubAdmin,
 };

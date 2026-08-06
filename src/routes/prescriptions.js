@@ -19,7 +19,12 @@ const {
   isUnlockedFor,
   presentPrescription,
 } = require('../utils/prescriptionRelease');
-const { lockBookingChannel } = require('../utils/bookingFlow');
+const {
+  lockBookingChannel,
+  releasePrescriptionsForSettledBooking,
+} = require('../utils/bookingFlow');
+// Commission split + wallet ledger. The ONLY writer of provider balances.
+const walletService = require('../services/walletService');
 const { PRESCRIPTION_UNLOCK_FEE, roundMoney } = require('../utils/money');
 const { renderPrescriptionPdf } = require('../utils/prescriptionPdf');
 const { ageFromDob } = require('../utils/age');
@@ -230,11 +235,21 @@ router.post('/', requireAccountId, async (req, res) => {
       { new: true, runValidators: true },
     );
 
-    // Legacy fix-up: bookings from the old pay-before-service flow have
-    // already settled the balance, so there is nothing left to collect —
-    // send them straight to `completed`. Idempotent second write; the
-    // single-winner claim above still guards the race.
-    if (claimed && (claimed.final_paid_at || claimed.final_transaction_id)) {
+    // Bookings whose balance is ALREADY settled when the doctor finalizes:
+    // legacy pay-before-service rows, and deposit-first bookings whose
+    // patient pre-paid the balance online after the admin's pricing call.
+    // Nothing is left to collect, so they go straight to `completed`.
+    // Idempotent second write; the single-winner claim above still guards
+    // the race. `preSettled` drives the two side effects that a normal
+    // booking gets at settlement time and this one therefore never had:
+    // releasing the script we are about to write, and crediting the
+    // provider — both deferred to here precisely because the visit had not
+    // happened when the money landed.
+    const preSettled = !!(
+      claimed &&
+      (claimed.final_paid_at || claimed.final_transaction_id)
+    );
+    if (preSettled) {
       claimed = await CareRequest.findOneAndUpdate(
         { _id: appointmentId, status: 'service_completed_awaiting_final_payment' },
         { $set: { status: 'completed', 'payment.released_at': now } },
@@ -348,6 +363,38 @@ router.post('/', requireAccountId, async (req, res) => {
     });
 
     const ioFinalize = req.app.get('io');
+
+    // The visit was paid for before it happened, so this freshly issued
+    // script has no balance left to gate it. Run the same post-settlement
+    // work the balance flow would have run, now that there is finally a
+    // script to run it on: mark it PAID and hand it to the admin release
+    // queue, then credit the providers for the visit they just delivered.
+    // Both are idempotent (the `payment_status` filter and the wallet
+    // ledger's transaction guard), and both are best-effort — the
+    // prescription itself is already committed.
+    if (preSettled) {
+      const settlementTran =
+        claimed.final_transaction_id || `PRESETTLED-${claimed._id}`;
+      try {
+        await releasePrescriptionsForSettledBooking(
+          ioFinalize,
+          claimed,
+          settlementTran,
+        );
+      } catch (_) {
+        /* release fan-out failure must not fail the issuance */
+      }
+      try {
+        await walletService.creditVisitEarnings(ioFinalize, claimed, {
+          method: claimed.payment_method === 'CASH_TO_PROVIDER'
+            ? 'CASH'
+            : 'DIGITAL',
+        });
+      } catch (_) {
+        /* earnings credit failure must not fail the issuance */
+      }
+    }
+
     if (ioFinalize) {
       ioFinalize.to(appointmentId.toString()).emit('appointment_status_change', {
         appointmentId: appointmentId.toString(),

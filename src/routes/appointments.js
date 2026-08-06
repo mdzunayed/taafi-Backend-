@@ -9,11 +9,15 @@ const {
   outstandingBalanceFor,
   releasePrescriptionsForSettledBooking,
   lockBookingChannel,
+  verifiedPaymentPatch,
 } = require('../utils/bookingFlow');
 const {
   safeEmitNotification,
   userRoomFor,
 } = require('../services/notificationService');
+// Balance-posture fan-out — keeps the OTHER assigned clinician's console (and
+// the patient's invoice) in step the instant this one settles the cash.
+const { emitBookingPaymentUpdated } = require('../utils/paymentBroadcast');
 // Push dispatch is offloaded to the BullMQ background queue (identical
 // signature to the old fcmService call, so nothing else changes). Falls
 // back to inline send when Redis is disabled.
@@ -607,6 +611,21 @@ router.post('/:id/complete', requireAccountId, async (req, res) => {
     // idempotency guard makes the overlap a no-op rather than a double credit.
     if (nextStatus === 'completed') {
       await walletService.creditVisitEarnings(io, appt, { method: 'DIGITAL' });
+      // Same reasoning for the scripts: the balance landed before the visit,
+      // so no settlement event will ever fire again for this booking. If a
+      // prescription was issued earlier in the visit it would otherwise stay
+      // PAYMENT_REQUIRED forever, with nothing left for the patient to pay.
+      // Idempotent (the `payment_status` filter) and best-effort — the visit
+      // is already closed.
+      try {
+        await releasePrescriptionsForSettledBooking(
+          io,
+          appt,
+          appt.final_transaction_id || `PRESETTLED-${appt._id}`,
+        );
+      } catch (_) {
+        /* release fan-out failure must not fail the completion */
+      }
     }
 
     // Service delivered → lock the chat into a read-only archive. A
@@ -675,7 +694,7 @@ router.post('/:id/complete', requireAccountId, async (req, res) => {
 //   - The ledger $inc lands only after the CAS wins, and the amount is
 //     computed server-side from the priced invoice (never trusted from
 //     the client body).
-router.post('/:id/collect-cash', requireAccountId, async (req, res) => {
+async function confirmCashCollection(req, res) {
   try {
     const { id } = req.params;
     if (!mongoose.isValidObjectId(id)) {
@@ -713,6 +732,16 @@ router.post('/:id/collect-cash', requireAccountId, async (req, res) => {
           final_transaction_id: tranId,
           final_paid_at: now,
           'payment.released_at': now,
+          // CHANNEL A of the dual prescription gate. The clinician is holding
+          // the physical cash, so their confirmation IS the verification —
+          // there is no third party left to check with, and the script
+          // unlocks in the SAME atomic write that records the money. Anything
+          // less (unlock as a follow-up write) would leave a window where the
+          // patient has paid and their prescription is still redacted.
+          ...verifiedPaymentPatch({
+            verifiedBy: `clinician:${req.accountId}`,
+            reference: tranId,
+          }),
         },
       },
       { new: true },
@@ -759,11 +788,17 @@ router.post('/:id/collect-cash', requireAccountId, async (req, res) => {
       (s) => String(s.accountId) === String(req.accountId),
     );
 
-    // Same downstream effects as a digital settlement: prescriptions →
-    // PAID, admin release queue + `prescription:paid`, patient receipt
-    // notification, live `prescription:release_updated` for an open Rx
-    // detail screen.
-    await releasePrescriptionsForSettledBooking(io, settled, tranId);
+    // Prescriptions → PAID + patient receipt + live
+    // `prescription:release_updated` for an open Rx detail screen.
+    //
+    // `autoApprove` is what makes cash different from a digital settlement:
+    // the doctor took the money in person and told the patient their
+    // prescription unlocks instantly, so the script skips the admin release
+    // queue and goes straight to UNLOCKED. A digital payment still needs an
+    // admin to verify the transaction first.
+    await releasePrescriptionsForSettledBooking(io, settled, tranId, {
+      autoApprove: true,
+    });
 
     if (io) {
       // Instant unlock signal for the patient app (invoice card +
@@ -788,6 +823,12 @@ router.post('/:id/collect-cash', requireAccountId, async (req, res) => {
         updatedBy: req.accountId,
         updatedRole: guard.identity.role,
         timestamp: now.toISOString(),
+      });
+      // Balance is PAID (in cash): every console on this visit — including
+      // the co-assigned nurse/doctor who did NOT take the money — drops its
+      // Collect Cash affordance.
+      await emitBookingPaymentUpdated(io, settled, {
+        reason: 'cash_settlement',
       });
     }
 
@@ -832,7 +873,14 @@ router.post('/:id/collect-cash', requireAccountId, async (req, res) => {
       .status(500)
       .json({ success: false, message: err.message || 'Server error' });
   }
-});
+}
+
+router.post('/:id/collect-cash', requireAccountId, confirmCashCollection);
+// The clinician console's own vocabulary for the same action, mounted in
+// server.js as `POST /api/clinician/bookings/:id/confirm-cash`. One handler,
+// so the cash path and the prescription unlock it triggers can never diverge
+// between the two URLs.
+router.post('/:id/confirm-cash', requireAccountId, confirmCashCollection);
 
 // PATCH /api/appointments/:id/accept
 //

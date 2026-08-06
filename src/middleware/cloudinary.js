@@ -132,7 +132,10 @@ function describeUploadError(err) {
 // Uploads a raw image buffer and returns the permanent https URL.
 // `publicId` is deterministic (derived from the owning doc id) so a
 // re-upload overwrites the previous image instead of leaking copies.
-function uploadBuffer(buffer, publicId) {
+// [resourceType] is 'image' for pictures and 'raw' for everything else
+// (patient medical documents arrive as PDFs too). Cloudinary refuses a PDF
+// on the image pipeline, so the caller picks the lane from the MIME type.
+function uploadBuffer(buffer, publicId, resourceType = 'image') {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
       {
@@ -140,7 +143,7 @@ function uploadBuffer(buffer, publicId) {
         folder: 'taafi',
         overwrite: true,
         invalidate: true,
-        resource_type: 'image',
+        resource_type: resourceType,
       },
       (err, result) => {
         if (err) return reject(describeUploadError(err));

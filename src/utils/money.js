@@ -4,10 +4,19 @@
 // 1000.1 - 100 - 0.2) otherwise leaks binary-fraction error into
 // balances the patient is actually charged.
 
-// Fixed slot-confirmation deposit charged in Phase 1. Deducted from the
-// final bill. Single source of truth for the whole flow (patient routes,
-// admin set-price validation, notification copy).
-const DEPOSIT_AMOUNT = 100;
+// Compiled-in fallback for the platform's SUGGESTED booking deposit — the
+// amount the admin console prefills its set-deposit field with. It charges
+// nobody by itself: under the four-phase flow a booking owes a deposit only
+// once an admin commits one for it on the review call.
+//
+// NOT the source of truth — that is `Settings.booking_deposit_amount`, resolved
+// through `services/pricingService`. This value is used only when the Settings
+// row is unreachable (cold cache + Mongo hiccup).
+//
+// Deliberately NOT env-overridable like PRESCRIPTION_UNLOCK_FEE below: a second
+// config surface would compete with the admin console's Finance settings, and
+// whichever one lost would silently disagree with what the patient was quoted.
+const DEFAULT_BOOKING_DEPOSIT = 100;
 
 // Round a currency value to 2 decimals. Non-finite input (NaN from a bad
 // cast, Infinity) normalizes to 0 so a malformed field can never poison a
@@ -26,4 +35,4 @@ function roundMoney(value) {
 const PRESCRIPTION_UNLOCK_FEE =
   roundMoney(Number(process.env.PRESCRIPTION_UNLOCK_FEE) || 100);
 
-module.exports = { DEPOSIT_AMOUNT, PRESCRIPTION_UNLOCK_FEE, roundMoney };
+module.exports = { DEFAULT_BOOKING_DEPOSIT, PRESCRIPTION_UNLOCK_FEE, roundMoney };

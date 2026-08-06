@@ -36,6 +36,16 @@ const ProviderSchema = new mongoose.Schema(
       default: 'offline',
       index: true,
     },
+    // Admin account gate, orthogonal to `verification_status`. A suspended
+    // provider keeps their credentials and verified flag but is withheld
+    // from dispatch matching until reinstated. Flipped by
+    // PATCH /api/admin/providers/:id/status.
+    status: {
+      type: String,
+      enum: ['active', 'suspended'],
+      default: 'active',
+      index: true,
+    },
     // Doctor / helper avatar uploaded via the Profile screen. Public
     // URL, served by Express static `/uploads`. Same value the linked
     // Account row carries — the upload route writes both in parallel

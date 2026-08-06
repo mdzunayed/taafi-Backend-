@@ -53,6 +53,11 @@ const MILESTONE_BY_KEY = new Map(
 const MILESTONE_BY_STATUS = {
   awaiting_deposit: 'REQUESTED',
   submitted: 'REQUESTED',
+  // The admin has priced the booking and the patient owes the deposit. Still
+  // step 1 for the tracker: nothing is confirmed until the money lands, and
+  // advancing the bar here would tell the patient their visit is booked when
+  // it is waiting on them.
+  deposit_required: 'REQUESTED',
   deposit_paid_admin_reviewing: 'REQUESTED',
 
   approved: 'CONFIRMED',

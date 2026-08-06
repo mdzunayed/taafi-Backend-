@@ -49,6 +49,25 @@ const SettingsSchema = new mongoose.Schema(
     // records a cash handover. Rationale: a provider sitting on the
     // platform's cash shouldn't also be draining their digital balance.
     cash_in_hand_limit: { type: Number, default: 5000, min: 0 },
+    // The DEFAULT advance deposit the admin console prefills when pricing a
+    // booking on the review call. It charges nobody by itself: under the
+    // four-phase flow a booking owes a deposit only once an admin commits one
+    // for it (`CareRequest.required_deposit`), which is also when the amount is
+    // snapshotted to `deposit_quoted_amount` — so retuning this never re-prices
+    // a booking the patient is already paying for.
+    //
+    // Read by clients through the public `GET /api/config/pricing`. Patient
+    // surfaces must NEVER render it: the amount a given patient owes is a
+    // per-case decision and always arrives on the booking row itself.
+    //
+    // `min: 1` rather than 0: a zero-amount default would prefill a deposit
+    // that opens a zero-amount gateway session and defeats the gate entirely.
+    booking_deposit_amount: {
+      type: Number,
+      default: 100,
+      min: 1,
+      max: 100000,
+    },
   },
   {
     timestamps: true,
@@ -74,6 +93,7 @@ SettingsSchema.statics.EDITABLE = [
   'system_notification',
   'platform_commission_percent',
   'cash_in_hand_limit',
+  'booking_deposit_amount',
 ];
 
 // Fetch (creating on first access) the one global settings document.

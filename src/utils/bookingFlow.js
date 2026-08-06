@@ -12,7 +12,9 @@ const {
 // signature to the old fcmService call, so nothing else changes). Falls
 // back to inline send when Redis is disabled.
 const { enqueuePush: sendHighPriorityPush } = require('../queues/notificationQueue');
-const { roundMoney } = require('./money');
+// Outstanding-balance math lives in paymentPosture.js — the one module the
+// invoice projection, the socket broadcast and these helpers all read from.
+const { outstandingBalanceFor } = require('./paymentPosture');
 const {
   releaseStateFor,
   notifyAdminsPrescriptionPaid,
@@ -117,16 +119,6 @@ function completionStatusFor(doc) {
     : 'service_completed_awaiting_final_payment';
 }
 
-// Outstanding balance for a priced request. Never negative. Mirrors
-// `outstandingFor` in routes/patient.js — assignment requires a
-// positive `final_price`, so every serviced booking is priced.
-function outstandingBalanceFor(doc) {
-  const fee = Number(doc.final_price) || 0;
-  const deposit = Number(doc.deposit_amount) || 0;
-  const discount = Number(doc.adjusted_discount) || 0;
-  return Math.max(0, roundMoney(fee - deposit - discount));
-}
-
 // The moment the patient is FIRST prompted for the outstanding balance:
 // the visit just parked in `service_completed_awaiting_final_payment`.
 // Best-effort — a notification failure must never tank the completion.
@@ -164,6 +156,48 @@ async function notifyPatientBalanceDue(io, doc) {
   }
 }
 
+// ── PHASE 4: the dual prescription gate ──────────────────────────────────────
+//
+// A prescription written for a visit stays LOCKED until the remaining balance
+// is verified through one of exactly two channels:
+//
+//   CHANNEL A — cash. The attending clinician takes the notes at the door and
+//               taps "Confirm Cash Received". Their confirmation IS the
+//               verification (they physically hold the money), so the script
+//               unlocks in the same write.
+//   CHANNEL B — online. The patient pays through the gateway; the booking
+//               parks in PENDING_ADMIN_VERIFICATION with the transaction
+//               reference, and an admin unlocks it from Finance & Billing
+//               after reconciling the payment.
+//
+// Both channels land here, so the booking-level latch (`prescription_unlocked`
+// + `remaining_payment_status`) can never disagree with the per-script release
+// state that `utils/prescriptionRelease.js` computes. Returns the patch to
+// merge into the settlement write rather than writing it itself, so the flip
+// is atomic with the money it is gated on.
+function verifiedPaymentPatch({ verifiedBy, reference = null }) {
+  const now = new Date();
+  return {
+    remaining_payment_status: 'VERIFIED',
+    remaining_payment_verified_at: now,
+    remaining_payment_verified_by: verifiedBy,
+    remaining_payment_reference: reference,
+    prescription_unlocked: true,
+    prescription_unlocked_at: now,
+  };
+}
+
+// CHANNEL B's holding state: money has arrived online but no human has
+// confirmed receipt, so the script stays locked. `reference` is the gateway
+// transaction id the admin reconciles against.
+function pendingVerificationPatch(reference) {
+  return {
+    remaining_payment_status: 'PENDING_ADMIN_VERIFICATION',
+    remaining_payment_reference: reference || null,
+    prescription_unlocked: false,
+  };
+}
+
 // Post-settlement side effects shared by BOTH balance-settlement paths
 // (digital gateway in routes/patient.js, cash-to-provider in
 // routes/appointments.js): the balance payment is what pays for the
@@ -172,21 +206,38 @@ async function notifyPatientBalanceDue(io, doc) {
 // duplicate settlement matches zero scripts and never re-notifies.
 // Best-effort: a notification failure must never tank the settlement
 // (the payment IS applied at this point).
-async function releasePrescriptionsForSettledBooking(io, booking, tranId) {
+// `autoApprove` skips the admin release queue entirely and unlocks the
+// script the moment the money lands. It is set ONLY by the cash path: the
+// doctor physically took the cash and told the patient their prescription
+// unlocks instantly, so there is nothing left for an admin to verify. The
+// digital path leaves it false — an online transaction still needs an
+// admin to confirm receipt before the script is released.
+async function releasePrescriptionsForSettledBooking(
+  io,
+  booking,
+  tranId,
+  { autoApprove = false } = {},
+) {
   const now = new Date();
+  const paidPatch = {
+    payment_status: 'PAID',
+    unlock_transaction_id: tranId,
+    paid_at: now,
+  };
+  if (autoApprove) {
+    paidPatch.admin_approval_status = 'APPROVED';
+    paidPatch.approved_by = 'system:cash_collection';
+    paidPatch.approved_at = now;
+  }
   await Prescription.updateMany(
     {
       appointment_id: booking._id,
       payment_status: { $in: ['PENDING', 'FAILED'] },
+      // A script an admin already rejected stays rejected — paying the
+      // balance (in cash or otherwise) must never resurrect it.
       admin_approval_status: { $ne: 'REJECTED' },
     },
-    {
-      $set: {
-        payment_status: 'PAID',
-        unlock_transaction_id: tranId,
-        paid_at: now,
-      },
-    },
+    { $set: paidPatch },
   );
   // Re-read only the scripts THIS settlement paid (tranId is unique per
   // settlement) so the fan-out below runs exactly once per script.
@@ -196,10 +247,11 @@ async function releasePrescriptionsForSettledBooking(io, booking, tranId) {
     unlock_transaction_id: tranId,
   });
   for (const script of paidScripts) {
-    // Admin queue entry + `prescription:paid` live refresh.
-    await notifyAdminsPrescriptionPaid(io, script);
-    // An open Rx detail screen flips PAYMENT_REQUIRED →
-    // PENDING_ADMIN_REVIEW without a manual refresh.
+    // Admin queue entry + `prescription:paid` live refresh. Skipped when
+    // auto-approved — there is no review to queue.
+    if (!autoApprove) await notifyAdminsPrescriptionPaid(io, script);
+    // An open Rx detail screen flips PAYMENT_REQUIRED → PENDING_ADMIN_REVIEW
+    // (digital) or straight to UNLOCKED (cash) without a manual refresh.
     if (io && script.patient_account_id) {
       io.to(userRoomFor(script.patient_account_id)).emit(
         'prescription:release_updated',
@@ -215,10 +267,13 @@ async function releasePrescriptionsForSettledBooking(io, booking, tranId) {
   try {
     const title = 'Payment received — booking complete';
     const body =
-      paidScripts.length > 0
-        ? 'Your booking is settled. Your prescription is with our admin ' +
-          "team for release — you'll be notified the moment it unlocks."
-        : 'Your booking is settled. Thank you for choosing Taafi.';
+      paidScripts.length === 0
+        ? 'Your booking is settled. Thank you for choosing Taafi.'
+        : autoApprove
+          ? 'Your booking is settled and your prescription is unlocked — ' +
+            'you can view and download it now.'
+          : 'Your booking is settled. Your prescription is with our admin ' +
+            "team for release — you'll be notified the moment it unlocks.";
     await safeEmitNotification(io, {
       recipientId: booking.patient_account_id,
       senderId: null,
@@ -237,6 +292,8 @@ module.exports = {
   outstandingBalanceFor,
   notifyPatientBalanceDue,
   releasePrescriptionsForSettledBooking,
+  verifiedPaymentPatch,
+  pendingVerificationPatch,
   isBookingChatOpen,
   lockBookingChannel,
   unlockBookingChannel,

@@ -17,9 +17,15 @@ const multer = require('multer');
 // message regex are both kept as fallbacks: a request already in flight
 // across a deploy, or an error raised somewhere that predates either tag,
 // must not regress to a 500.
-const MIMETYPE_REJECTION = /only jpeg[ ,/]+png[ ,/]*(and )?webp images are allowed/i;
+const MIMETYPE_REJECTION = /only (pdf, )?jpeg[ ,/]+png[ ,/]*(and )?webp (images|files) are allowed/i;
 
-const REJECTION_CODES = new Set(['ONLY_ALLOWED_IMAGES', 'INVALID_FILE_TYPE']);
+// 'ONLY_ALLOWED_DOCUMENTS' is the patient medical-document uploader's tag
+// (PDF + images); it takes the same 415 path as the image-only rejection.
+const REJECTION_CODES = new Set([
+  'ONLY_ALLOWED_IMAGES',
+  'ONLY_ALLOWED_DOCUMENTS',
+  'INVALID_FILE_TYPE',
+]);
 
 function isMimetypeRejection(err) {
   if (!err) return false;
@@ -29,7 +35,10 @@ function isMimetypeRejection(err) {
 }
 
 const CODE_MAP = {
-  LIMIT_FILE_SIZE: [413, 'Image is larger than the 8 MB limit.'],
+  // Both uploaders (images, patient documents) cap at 8 MB, so one message
+  // is accurate for either. MulterError carries no limit field, so a
+  // divergent cap here would have to be reported vaguely.
+  LIMIT_FILE_SIZE: [413, 'File is larger than the 8 MB limit.'],
   LIMIT_UNEXPECTED_FILE: [400, 'Unexpected upload field.'],
   LIMIT_FILE_COUNT: [400, 'Too many files in one request.'],
   LIMIT_PART_COUNT: [400, 'Too many parts in the upload.'],

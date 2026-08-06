@@ -7,8 +7,34 @@ const ContentItemSchema = new mongoose.Schema(
     itemId: { type: String, required: true },
     title: { type: String, required: true, trim: true },
     subtitle: { type: String, default: null },
+    // Bengali counterparts of the two text slots. The app has no locale
+    // switch — BN renders as a secondary line beside EN, the same treatment
+    // the section title already gets — so null simply means "show EN alone".
+    titleBn: { type: String, default: null },
+    subtitleBn: { type: String, default: null },
     imageUrl: { type: String, required: true },
     priceTag: { type: String, default: null },
+    // The capsule floating on the card image ("Popular", "New"). Distinct from
+    // `subtitle`: before this field existed the renderer spent `subtitle` on
+    // that capsule, so cards saved back then have no badgeText and the client
+    // falls back to `subtitle` for them — they keep rendering unchanged.
+    badgeText: { type: String, default: null },
+    // Per-card visibility. The section-level `isActive` hides a whole block;
+    // this hides a single card while leaving it editable in the CMS. Stripped
+    // from the public feed (`?active=1`), always present for admins.
+    isActive: { type: Boolean, default: true },
+    // Which Home filter pill this card belongs under. Null ⇒ the card is
+    // untagged and only appears under the implicit "All" pill.
+    //
+    // Only the Care Services section actually filters on this today, but it
+    // lives on the shared item schema rather than a Care-Services-specific one
+    // because there is no such thing: CARE_SERVICES is an ordinary
+    // DynamicSection with a reserved `sectionKey`.
+    categoryId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Category',
+      default: null,
+    },
     // --- Target action linking -------------------------------------------
     // What a tap on this card does. Mirrors PromoBanner.actionType; only the
     // field matching `targetType` is expected to be set. Items saved before
@@ -72,6 +98,19 @@ const DynamicSectionSchema = new mongoose.Schema(
         'SINGLE_WIDE_BANNER',
       ],
       required: true,
+    },
+    // How the section's cards are arranged. Orthogonal to `uiTemplate`, which
+    // says what a *card* looks like; this says how the cards are laid out.
+    //
+    // Only the reserved CARE_SERVICES section reads it today — its renderer is
+    // the adaptive layout engine in the app (care_services_section.dart), and
+    // this is the field the admin's layout selector writes. Other sections
+    // keep rendering from `uiTemplate` and ignore it, so the default is the
+    // swipeable rail those sections have always used.
+    layoutType: {
+      type: String,
+      enum: ['GRID_2_COL', 'CAROUSEL', 'LIST'],
+      default: 'CAROUSEL',
     },
     // Ascending display order below the fixed Banners + Care Services blocks.
     orderIndex: { type: Number, required: true, index: true },

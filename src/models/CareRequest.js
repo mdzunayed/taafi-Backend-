@@ -1,7 +1,18 @@
 const mongoose = require('mongoose');
 const { roundMoney } = require('../utils/money');
+// Balance posture (settled?, how much is left, ONLINE vs CASH) — derived in
+// exactly one place so this projection, the socket broadcast and the provider
+// payloads can never disagree about whether cash is still owed.
+const { paymentPostureFor } = require('../utils/paymentPosture');
 const { describeMilestone } = require('../utils/bookingMilestones');
 const { PROVIDER_TYPES } = require('../utils/providerTypes');
+// Resolves "what deposit applies to this booking" from the paid amount, the
+// quoted amount, and the admin-configured default — in that precedence.
+const {
+  requiredDepositFor,
+  hasRequiredDeposit,
+  cachedBookingDepositAmount,
+} = require('../services/pricingService');
 
 // `care_requests` collection. Field names are snake_case to match the
 // Flutter snake_case_json parser layer exactly (no camelCase drift). The
@@ -35,6 +46,41 @@ const CareRequestSchema = new mongoose.Schema(
       default: null,
     },
     offered_budget: { type: Number, default: 0 },
+
+    // The rail the patient picked at checkout for the confirmation deposit.
+    // Recorded at booking time even though nothing is charged then (the
+    // deposit does not exist until the admin sets it in Phase 2) so the
+    // Phase-3 payment sheet can preselect the method they already chose.
+    // Always a DIGITAL rail — the deposit cannot be paid in cash, because it
+    // is what confirms the visit before anyone is dispatched. The cash option
+    // belongs to the REMAINING balance, and lives on `payment_preference`.
+    // Null for bookings made before the checkout flow shipped.
+    payment_channel: {
+      type: String,
+      enum: ['BKASH', 'NAGAD', 'ROCKET', 'UPAY', 'CARD', null],
+      default: null,
+    },
+
+    // Previous medical documents the patient attached at booking time
+    // (discharge summaries, old prescriptions, lab reports) — PDFs or
+    // images, uploaded via POST /patient/documents before the booking
+    // exists, then carried in on the create call. `url` is a full
+    // Cloudinary https URL, or a bare filename served off the /uploads
+    // mount in local dev (same convention as Service.imageUrl).
+    documents: {
+      type: [
+        {
+          _id: false,
+          name: { type: String, default: '' },
+          url: { type: String, default: '' },
+          mime: { type: String, default: '' },
+          size: { type: Number, default: 0 },
+          uploaded_at: { type: Date, default: Date.now },
+        },
+      ],
+      default: [],
+    },
+
     preferred_time: { type: String, default: null }, // ISO-8601 string or null (ASAP)
     duration_hours: { type: Number, default: 1 },
     condition_note: { type: String, default: '' },
@@ -66,14 +112,20 @@ const CareRequestSchema = new mongoose.Schema(
     status: {
       type: String,
       enum: [
-        // --- Two-phase booking confirmation states -----------------------
-        // Phase 1: the patient has created the booking but has NOT yet paid
-        // the fixed ৳100 confirmation deposit. The slot is not "locked in"
-        // and admins do NOT see it in triage until the deposit clears.
+        // --- LEGACY deposit-first state ----------------------------------
+        // Retired by the zero-cost booking flow: bookings used to be created
+        // here, unpaid and invisible to triage, until a fixed ৳100 deposit
+        // cleared. New bookings are created `submitted` instead. Kept in the
+        // enum so in-flight rows stay readable and payable.
         'awaiting_deposit',
-        // Phase 1 complete: the ৳100 deposit was confirmed by the gateway.
-        // The booking is now live and sits in the admin's care-management
-        // review queue (call the client, assess severity, set the fee).
+        // --- Four-phase lifecycle ----------------------------------------
+        // Phase 2: the admin ran the review call and committed BOTH numbers
+        // (total service fee + the deposit THIS booking must pay). The
+        // patient now owes `required_deposit` to confirm the visit. No
+        // provider may be dispatched until it clears.
+        'deposit_required',
+        // Phase 3: the admin-set deposit was confirmed by the gateway. The
+        // booking is ready for deposit verification + team assignment.
         'deposit_paid_admin_reviewing',
         // LEGACY pay-before-service state: the admin set the final fee and
         // the patient had to clear the balance before dispatch (`approved`).
@@ -104,20 +156,49 @@ const CareRequestSchema = new mongoose.Schema(
       default: 'submitted',
       index: true,
     },
-    // Reused as the "final service fee" the admin assigns after the manual
-    // phone review (spec: finalServiceFee). Set by both the two-phase
-    // set-price gateway and the legacy provider-dispatch assign route.
+    // THE total service fee for this visit, committed by the admin on the
+    // Phase-2 review call. Serialized as `total_service_fee` for the clients
+    // (see projectInvoice); `final_price` remains the storage name because
+    // dispatch, the wallet ledger, the milestone engine and every legacy
+    // route already read it. One number, two names — never two numbers.
     final_price: { type: Number, default: null },
     // Reused as the admin's onboarding-call summary (spec: adminNotes).
     admin_note: { type: String, default: null },
 
-    // --- Two-phase confirmation deposit & dynamic invoicing --------------
-    // Fixed ৳100 slot-confirmation deposit. `deposit_amount` is 0 until the
-    // gateway confirms, then locked to 100. The deposit is DEDUCTED from the
-    // final bill: outstanding = final_price - deposit_amount - adjusted_discount.
+    // --- Dynamic deposit & dynamic invoicing -----------------------------
+    // Confirmation deposit. `deposit_amount` is 0 until the gateway confirms,
+    // then locked to whatever was actually PAID. The deposit is DEDUCTED from
+    // the final bill:
+    //   outstanding = final_price - deposit_amount - adjusted_discount.
     deposit_amount: { type: Number, default: 0 },
+    // What the ADMIN decided this specific booking must deposit, set on the
+    // Phase-2 review call alongside `final_price`. Null until then — which is
+    // exactly what makes Phase 1 free: a booking with no `required_deposit`
+    // owes nothing and shows ৳0 due at checkout.
+    //
+    // Per-booking by design. The platform-wide `Settings.booking_deposit_amount`
+    // is now only a DEFAULT the admin console prefills the field with; a
+    // cardiac post-op case and a routine dressing change do not owe the same
+    // deposit, and the admin sets each one after speaking to the patient.
+    required_deposit: { type: Number, default: null },
+    deposit_set_at: { type: Date, default: null },
+    // Who committed the fee + deposit, for the billing audit trail.
+    deposit_set_by: { type: String, default: null },
+    // What this booking was QUOTED. Mirrors `required_deposit` the moment the
+    // admin sets it and is then immutable: an admin CORRECTING the fee must
+    // never move the amount under a patient who is mid-checkout, and must
+    // never make `/deposit/confirm` reject a payment opened against the old
+    // number. Null on rows that never reached Phase 2.
+    deposit_quoted_amount: { type: Number, default: null },
     deposit_transaction_id: { type: String, default: null },
     deposit_paid_at: { type: Date, default: null },
+    // Last failed deposit attempt (gateway declined / validation rejected).
+    // Purely informational: the booking stays `awaiting_deposit` and remains
+    // payable, but the patient surface can say "your payment did not go
+    // through" instead of the neutral "not paid yet". Cleared the moment a
+    // later attempt settles, so it can never outlive the failure it records.
+    deposit_failed_at: { type: Date, default: null },
+    deposit_failure_reason: { type: String, default: null },
     // Optional promotional adjustment / waiver applied by the admin at pricing.
     adjusted_discount: { type: Number, default: 0 },
     // Code the patient carried in from a PROMO_CODE promo-banner tap (see
@@ -159,6 +240,46 @@ const CareRequestSchema = new mongoose.Schema(
       enum: ['DIGITAL', 'CASH_ON_SERVICE', null],
       default: null,
     },
+
+    // --- Phase 4: remaining-balance verification & prescription gate ------
+    // Whether the money for the REMAINING balance has been verified by a
+    // human, which is a stricter question than "did a payment land":
+    //
+    //   PENDING                     — nothing settled yet.
+    //   PENDING_ADMIN_VERIFICATION  — CHANNEL B. The patient paid online; the
+    //                                 transaction reference is recorded and an
+    //                                 admin must confirm receipt in Finance &
+    //                                 Billing. The prescription stays LOCKED.
+    //   VERIFIED                    — the money is confirmed, through either
+    //                                 channel, and `prescription_unlocked`
+    //                                 flips true in the same write.
+    //
+    // CHANNEL A (cash) skips the middle state entirely: the clinician took the
+    // notes in person and confirmed it on their console, so there is nothing
+    // left for an admin to verify and the script unlocks instantly.
+    remaining_payment_status: {
+      type: String,
+      enum: ['PENDING', 'PENDING_ADMIN_VERIFICATION', 'VERIFIED'],
+      default: 'PENDING',
+      index: true,
+    },
+    // Gateway/manual reference the admin reconciles against (bKash TrxID,
+    // Nagad reference, card auth code). Written by the online balance
+    // settlement; the admin reads it in the verification queue.
+    remaining_payment_reference: { type: String, default: null },
+    remaining_payment_verified_at: { type: Date, default: null },
+    // Account id of the verifier, or a `system:` sentinel for the cash path
+    // (the clinician's own confirmation IS the verification).
+    remaining_payment_verified_by: { type: String, default: null },
+
+    // The dual-gate latch. A prescription written for this visit stays
+    // redacted until this is true, and it only ever becomes true alongside
+    // `remaining_payment_status: 'VERIFIED'` — cash confirmed by the attending
+    // clinician, or an online payment verified by an admin. Stored rather than
+    // derived so the gate is auditable: "when did this unlock, and who did it".
+    prescription_unlocked: { type: Boolean, default: false },
+    prescription_unlocked_at: { type: Date, default: null },
+
     assigned_doctor_id: { type: String, default: null, index: true },
     assigned_doctor_name: { type: String, default: null },
     assigned_nurse_id: { type: String, default: null, index: true },
@@ -377,12 +498,149 @@ CareRequestSchema.pre('save', function (next) {
   next();
 });
 
+// Canonical `status` → the four-phase lifecycle name the clients branch on.
+//
+// Derived, never stored, so the phase can never disagree with the status the
+// payment and dispatch code actually runs on. The internal enum stays richer
+// than four values (provider acceptance, nurse hand-off, terminal states);
+// this is the projection down to the vocabulary the spec — and every client
+// screen — speaks.
+const PHASE_BY_STATUS = {
+  // Phase 1 — placed for free, waiting on the admin's review call.
+  submitted: 'REQUEST_SUBMITTED',
+  awaiting_deposit: 'REQUEST_SUBMITTED', // legacy rows, never charged now
+  // Phase 2 — fee + deposit committed; the patient owes the deposit.
+  deposit_required: 'DEPOSIT_REQUIRED',
+  // Phase 3 — deposit cleared; awaiting verification + team assignment.
+  deposit_paid_admin_reviewing: 'DEPOSIT_PAID',
+  approved: 'DEPOSIT_PAID',
+  amount_assigned_awaiting_final_payment: 'DEPOSIT_PAID',
+  // Phase 3 complete — a team is dispatched and the visit is running.
+  assigned: 'ASSIGNED',
+  enroute: 'ASSIGNED',
+  on_the_way: 'ASSIGNED',
+  arrived: 'ASSIGNED',
+  in_service: 'ASSIGNED',
+  nurse_completed: 'ASSIGNED',
+  // Phase 4 — service delivered, remaining balance due.
+  service_completed_awaiting_final_payment: 'SERVICE_COMPLETED',
+  completed: 'COMPLETED',
+  rejected: 'CANCELLED',
+  cancelled: 'CANCELLED',
+};
+
+// Four-phase invoice projection.
+//
+// The stored fields are the ones the whole platform already runs on
+// (`final_price`, `deposit_amount`, `adjusted_discount`,
+// `payment_preference`). These derived aliases give every client the spec's
+// vocabulary — total service fee, required deposit, remaining balance, and
+// whether each of the three has been paid — without renaming storage under
+// the admin console, the provider consoles and the milestone engine, all of
+// which read the canonical names.
+//
+// `pricing_state` is the spec's UNDER_REVIEW / PRICE_SET progression,
+// derived rather than stored so it can never drift from the money:
+//   UNDER_REVIEW → admin has not committed a fee yet
+//   PRICE_SET    → fee committed, a balance is still outstanding
+//   SETTLED      → nothing left to collect
+// Bookings whose admin-set deposit is still unpaid report AWAITING_DEPOSIT.
+function projectInvoice(ret) {
+  const fee = Number(ret.final_price) || 0;
+  const deposit = Number(ret.deposit_amount) || 0;
+  const depositPaid = Boolean(ret.deposit_paid_at) || deposit > 0;
+  const posture = paymentPostureFor(ret);
+  const remaining = posture.remainingBalance;
+  const settled = posture.settled;
+
+  // Has a deposit been committed for this booking yet? This — not the status,
+  // and not the amount paid — is what separates Phase 1 from Phase 2, and it
+  // is what makes the checkout screen legitimately free: a booking with no
+  // committed deposit owes nothing.
+  //
+  // Reads the immutable quote as well as the admin-set amount, so a legacy
+  // `awaiting_deposit` row (quoted under the retired flow, never given a
+  // `required_deposit`) still correctly reports a deposit as OWED rather than
+  // silently becoming free.
+  const depositSet = hasRequiredDeposit(ret);
+
+  ret.deposit_paid = depositPaid;
+  // Four-state gate the patient app branches on directly, so no client ever
+  // has to infer "is the deposit in?" from an amount or a status string:
+  //   NOT_REQUIRED — Phase 1. The admin has not set a deposit; ৳0 is due and
+  //                  no payment CTA may render. Never conflate with PENDING:
+  //                  showing "Pay ৳100 deposit" on a free booking is exactly
+  //                  the bug the zero-cost flow exists to remove.
+  //   PENDING      — Phase 2. An amount is set and the patient owes it.
+  //   FAILED       — the last attempt was declined; still owed, still payable.
+  //   CONFIRMED    — the gateway settled it (money is in).
+  ret.deposit_status = depositPaid
+    ? 'CONFIRMED'
+    : !depositSet
+      ? 'NOT_REQUIRED'
+      : ret.deposit_failed_at
+        ? 'FAILED'
+        : 'PENDING';
+  // Spec alias: UNPAID | PAID, the plain answer to "has the deposit landed".
+  ret.deposit_payment_status = depositPaid ? 'PAID' : 'UNPAID';
+  // THE deposit figure for this booking, in one field the clients can render
+  // verbatim in every state: what was paid if paid, what the admin set if not,
+  // and null while no deposit has been set at all — which is what lets the
+  // checkout screen show ৳0 rather than guessing at the platform default.
+  ret.deposit_required_amount =
+    depositPaid || depositSet
+      ? requiredDepositFor(ret, cachedBookingDepositAmount())
+      : null;
+  // Spec name for the same number, alongside the fee it was derived from.
+  ret.required_deposit = ret.deposit_required_amount;
+  ret.total_service_fee = fee > 0 ? roundMoney(fee) : null;
+  ret.final_service_price = ret.total_service_fee;
+  ret.remaining_balance = settled ? 0 : remaining;
+  // How the patient will settle what is left after the deposit, in the spec's
+  // CASH | ONLINE vocabulary rather than the stored `payment_preference`
+  // enum. Same normalization the provider consoles already gate on, so the
+  // two can never name the same booking differently.
+  ret.remaining_payment_method = posture.channel;
+  // Normalized balance posture every client branches on. `payment_channel`
+  // collapses the two stored enums (`payment_method` once settled, the
+  // patient's `payment_preference` before that) into ONLINE | CASH, and
+  // `payment_status` says whether the balance itself is PAID | PENDING.
+  // `cash_collection_required` is the provider consoles' single gate for the
+  // Collect Cash sheet — never re-derive it client-side.
+  ret.payment_channel = posture.channel;
+  ret.payment_status = posture.status;
+  ret.cash_collection_required = posture.cashCollectable;
+
+  // Where this booking sits in the four-phase lifecycle, and whether the
+  // clinical payload it produced has been released. `prescription_unlocked`
+  // is echoed with an explicit boolean cast so a legacy row that predates the
+  // field reports `false` rather than `undefined` — a client reading
+  // undefined as "not locked" would render the script it must not show.
+  ret.booking_phase =
+    PHASE_BY_STATUS[String(ret.status || '').toLowerCase()] ||
+    'REQUEST_SUBMITTED';
+  ret.prescription_unlocked = ret.prescription_unlocked === true;
+  ret.remaining_payment_status = ret.remaining_payment_status || 'PENDING';
+
+  if (!depositPaid) {
+    ret.pricing_state = 'AWAITING_DEPOSIT';
+  } else if (settled || remaining === 0) {
+    ret.pricing_state = 'SETTLED';
+  } else if (fee > 0) {
+    ret.pricing_state = 'PRICE_SET';
+  } else {
+    ret.pricing_state = 'UNDER_REVIEW';
+  }
+  return ret;
+}
+
 CareRequestSchema.set('toJSON', {
   virtuals: true,
   versionKey: false,
   transform: (_doc, ret) => {
     ret.id = ret._id.toString();
     delete ret._id;
+    projectInvoice(ret);
     // Derive the patient-facing tracker block (milestone key, step N of 6,
     // label, formatted schedule, and the full six-step timeline) from the
     // canonical status. Additive — every existing consumer ignores it, and

@@ -16,6 +16,23 @@ const ServiceSchema = new mongoose.Schema(
     // edit meant to fix it. Normalizing at the route boundary gives the same
     // guarantee without stranding un-migrated rows.
     category: { type: String, default: '' },
+    // Explicit Home-pill assignment — the CMS field behind "Manage Services →
+    // Home categories". One service can sit under several pills ("Post-op" AND
+    // "Doctor in Home"), which the single free-text `category` above could
+    // never express.
+    //
+    // AUTHORITATIVE WHEN NON-EMPTY: `resolveCategorySlugs` uses these and
+    // ignores `category` entirely, so unticking a pill in the CMS actually
+    // removes the service from it. An empty array means "never assigned", and
+    // the legacy free-text join still applies — which is what every row that
+    // predates this field relies on.
+    categoryIds: [
+      { type: mongoose.Schema.Types.ObjectId, ref: 'Category', index: true },
+    ],
+    // Can this service be dispatched as an urgent/same-day visit? Drives the
+    // "Urgent available" sub-filter on the patient category view. Admin-owned
+    // and never inferred: a wrong guess here is a promise to a patient.
+    isUrgentAvailable: { type: Boolean, default: false, index: true },
     // Who attends this service — DOCTOR / NURSE / PHYSIOTHERAPIST / LAB_TECH
     // (canonical list in ../utils/providerTypes.js). Copied onto every booking
     // at creation time, where it drives the patient tracker's wording ("Nurse

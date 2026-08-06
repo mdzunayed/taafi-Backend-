@@ -27,11 +27,14 @@ const {
 // back to inline send when Redis is disabled.
 const { enqueuePush: sendHighPriorityPush } = require('../queues/notificationQueue');
 const { requireRole } = require('../middleware/auth');
+const walletService = require('../services/walletService');
 const { normalizePhone } = require('../utils/phone');
-const { DEPOSIT_AMOUNT, roundMoney } = require('../utils/money');
+const { roundMoney } = require('../utils/money');
+const { invalidatePricingCache } = require('../services/pricingService');
 const {
   lockBookingChannel,
   unlockBookingChannel,
+  verifiedPaymentPatch,
 } = require('../utils/bookingFlow');
 const {
   MILESTONES,
@@ -41,6 +44,12 @@ const {
   statusHistoryEntry,
   formatSchedule,
 } = require('../utils/bookingMilestones');
+// Patient medical documents: the `attachments` view (presigned, expiring
+// URLs) that every admin booking read carries, plus the shared delivery
+// handler this router still exposes under its legacy `/admin/documents/:token`
+// path.
+const { withAttachments } = require('../utils/bookingAttachments');
+const { deliverDocument } = require('./documents');
 const { haversineKm, readLatLng } = require('../utils/geo');
 const { providerTypeFromRole } = require('../utils/providerTypes');
 const adminController = require('../controllers/admin.controller');
@@ -56,21 +65,100 @@ const TERMINAL = ['completed', 'cancelled', 'rejected'];
 
 // States a team may be assigned FROM. Assignment IS the admin's approval
 // step: a booking leaves review only through here (with a positive fee).
-//   deposit_paid_admin_reviewing — the normal path out of review
+//   deposit_paid_admin_reviewing — the normal path, deposit cleared
 //   approved                     — needs (re-)assignment (doctor declined,
 //                                  or a legacy balance payment landed)
 //   assigned                     — team change on an un-accepted dispatch
-//   amount_assigned_awaiting_final_payment / submitted — legacy in-flight
-//                                  documents predating the current flow
-// Everything else (deposit unpaid, service already delivered, terminal)
-// is rejected with a 409.
+//   amount_assigned_awaiting_final_payment — legacy in-flight documents
+// Everything else (service already delivered, terminal) is rejected with a
+// 409. `submitted` and `deposit_required` are deliberately ABSENT: those are
+// the pre-deposit phases, and dispatching from them would send a clinician to
+// a home whose visit the patient has not confirmed. `assertDepositCleared`
+// below turns that into an explanation rather than a bare rejection.
 const ASSIGNABLE = [
   'deposit_paid_admin_reviewing',
   'approved',
   'assigned',
   'amount_assigned_awaiting_final_payment',
-  'submitted',
 ];
+
+// PHASE 3 GATE: no provider is dispatched until the deposit is in.
+//
+// The `ASSIGNABLE` list already excludes the pre-deposit states, but a bare
+// "cannot be assigned" 409 reads as a bug to the admin staring at a booking
+// they just priced. This distinguishes the two reasons a booking is not ready
+// and tells them what to do next. Responds and returns true when blocked, so
+// callers read as `if (rejectIfDepositUnpaid(res, doc)) return;`.
+function rejectIfDepositUnpaid(res, doc) {
+  if (!doc || ASSIGNABLE.includes(doc.status)) return false;
+  const needsQuote = doc.status === 'submitted' || !(Number(doc.required_deposit) > 0);
+  if (doc.status === 'deposit_required' || needsQuote) {
+    res.status(409).json({
+      success: false,
+      message: needsQuote
+        ? 'Set the service fee and deposit for this booking before assigning ' +
+          'a team.'
+        : 'This booking cannot be assigned yet — the patient has not paid ' +
+          `the ৳${Number(doc.required_deposit) || 0} deposit.`,
+      status: doc.status,
+      depositPaid: false,
+    });
+    return true;
+  }
+  return false;
+}
+
+// Visit lifecycle states where a provider is physically executing a visit
+// (as opposed to merely holding a future slot). A provider in one of these
+// on ANY booking is ON_SERVICE right now regardless of scheduled time.
+const ON_VISIT_STATES = ['enroute', 'on_the_way', 'arrived', 'in_service', 'nurse_completed'];
+// Every non-terminal state that occupies a provider's calendar. Shared by
+// the dispatch roster (which renders these as ON_SERVICE) and the
+// assignment guard below, so the greyed-out row an admin sees and the 400
+// the API returns can never drift apart. `assigned` counts: a dispatched
+// but not-yet-started visit still owns the provider's next slot.
+const OCCUPYING_STATES = ['assigned', ...ON_VISIT_STATES];
+
+// The strict one-service-at-a-time rule. Returns the booking currently
+// occupying `providerId`, or null when they are free to be dispatched.
+// `excludeRequestId` is the booking being assigned — re-assigning it (e.g.
+// adding a nurse to a visit that already has this doctor) must never trip
+// the guard on itself, mirroring the same skip in buildDispatchRoster.
+async function findActiveAssignmentFor(providerId, role, excludeRequestId) {
+  if (!providerId) return null;
+  const idField = role === 'nurse' ? 'assigned_nurse_id' : 'assigned_doctor_id';
+  return CareRequest.findOne({
+    [idField]: providerId.toString(),
+    status: { $in: OCCUPYING_STATES },
+    _id: { $ne: excludeRequestId },
+  }).select('_id status care_type preferred_time');
+}
+
+// Shared 400 for both assignment entry points.
+const PROVIDER_BUSY_MESSAGE =
+  'This provider is currently on an active service and cannot be assigned ' +
+  'to another request simultaneously.';
+
+// Runs the availability guard for whichever roles this call is assigning.
+// Responds and returns true when either provider is occupied, so callers
+// read as `if (await rejectIfProviderBusy(...)) return;`.
+async function rejectIfProviderBusy(res, { doctorId, nurseId, excludeRequestId }) {
+  const [doctorBusy, nurseBusy] = await Promise.all([
+    findActiveAssignmentFor(doctorId, 'doctor', excludeRequestId),
+    findActiveAssignmentFor(nurseId, 'nurse', excludeRequestId),
+  ]);
+  const busy = doctorBusy || nurseBusy;
+  if (!busy) return false;
+  res.status(400).json({
+    success: false,
+    message: PROVIDER_BUSY_MESSAGE,
+    // Lets the admin console deep-link to the visit that's blocking the
+    // dispatch instead of leaving them to hunt for it.
+    conflictingRequestId: busy._id.toString(),
+    conflictingStatus: busy.status,
+  });
+  return true;
+}
 
 // Folds the four fee sub-fields into `payment.total`, mirroring the
 // CareRequest `pre('save')` hook. We need it inline because the atomic
@@ -414,25 +502,70 @@ router.post(
 router.get('/requests', requireRole('admin'), async (_req, res) => {
   try {
     const docs = await CareRequest.find().sort({ created_at: -1 });
-    res.json(docs.map((d) => d.toJSON()));
+    // `withAttachments` mints one presigned grant per attached medical
+    // document, so the assignment console can render (and open) a patient's
+    // discharge summary without ever holding the raw storage URL.
+    res.json(docs.map((d) => withAttachments(d.toJSON())));
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// POST /admin/requests/:id/set-price
+// GET /admin/bookings/:id  (alias: GET /admin/requests/:id)
+//
+// Single booking, in the same shape the list emits — including the
+// `attachments` array the Assign Doctor/Nurse drawer reads. Grants expire, so
+// a drawer opened from a stale list re-reads here to get fresh links rather
+// than showing a tile that 403s on click.
+async function getBooking(req, res, next) {
+  try {
+    // Fall THROUGH rather than 400 on a non-id: this route is declared above
+    // literal siblings like `/bookings/pending-verification`, and a param
+    // route that swallowed them would silently break those endpoints.
+    if (!mongoose.isValidObjectId(req.params.id)) return next();
+    const doc = await CareRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ message: 'Booking not found' });
+    // Same populated provider block the assign responses return, so the
+    // drawer renders one consistent shape whichever call filled it.
+    res.json(withAttachments(await attachDoctorToRequest(doc.toJSON())));
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+}
+
+router.get('/bookings/:id', requireRole('admin'), getBooking);
+router.get('/requests/:id', requireRole('admin'), getBooking);
+
+// GET /admin/documents/:token — deliver ONE patient medical document.
+//
+// Legacy alias. The handler now lives in routes/documents.js and is mounted
+// canonically at `/api/documents/:token`, because the assigned doctor / nurse
+// consoles read the same documents and should not be calling an `/admin/`
+// URL to do it. Kept here so grants minted before the move — they live ~30
+// minutes — and any admin surface holding one still resolve.
+//
+// Deliberately not behind `requireRole('admin')`: the presigned grant in the
+// path IS the credential. See routes/documents.js for the full rationale.
+router.get('/documents/:token', deliverDocument);
+
+// Pricing gateway, reachable as either:
+//   POST  /admin/requests/:id/set-price      (original admin-console path)
+//   PATCH /api/admin/bookings/:id/set-price  (deposit-first booking API)
 //   { final_service_fee, adjusted_discount?, admin_note? }
 //
-// Pricing gateway. After the admin reviews the paid booking and calls the
-// client, they commit the assessed base service fee here. Pricing is a
-// SILENT invoice update — it never changes the booking status and never
-// prompts the patient to pay. The booking leaves review only via team
-// assignment (`/assign` below, which requires a positive fee), and the
-// patient is first asked for the balance after the service completes
-// (`service_completed_awaiting_final_payment`). Re-pricing a booking
-// already awaiting payment (new or legacy state) DOES re-notify with the
-// corrected outstanding amount.
-router.post('/requests/:id/set-price', requireRole('admin'), async (req, res) => {
+// Deposit-first model: the booking carries NO price until here. The patient
+// paid the confirmation deposit online, the admin reviewed the case and called them,
+// and this commits the assessed service fee. The backend derives the
+// remaining balance (fee − deposit − discount) and tells the patient, who can
+// then choose to settle it in cash at the door or online
+// (PATCH /patient/requests/:id/payment-preference).
+//
+// Pricing does NOT change the booking status — the lifecycle enum is owned by
+// dispatch and service delivery, and the patient-facing "price set" state is
+// derived from the money itself (`pricing_state` on the serialized row), so
+// the two can never disagree. Re-pricing a booking whose balance is already
+// payable re-notifies with the corrected amount.
+async function setBookingPrice(req, res) {
   try {
     const b = req.body || {};
     const feeRaw = Number(b.final_service_fee ?? b.finalServiceFee ?? b.final_price);
@@ -447,12 +580,36 @@ router.post('/requests/:id/set-price', requireRole('admin'), async (req, res) =>
     if (discount < 0) {
       return res.status(400).json({ message: 'Discount cannot be negative.' });
     }
+    // Validate against what this booking ACTUALLY PAID, not the configured
+    // platform deposit. `outstandingBalanceFor` computes
+    // `fee − deposit_amount − discount`; validating against any other figure
+    // lets this guard and the balance derivation disagree, which is exactly the
+    // negative balance it exists to prevent.
+    //
+    // This also fixes the legacy `amount_assigned_awaiting_final_payment` rows
+    // in PRICEABLE below, which never paid a deposit at all: they used to be
+    // forced above a ৳100 floor and then credited a deposit that did not exist.
+    const existing = await CareRequest.findById(req.params.id);
+    if (!existing) {
+      return res.status(404).json({ message: 'Booking not found.' });
+    }
+    // What the deposit is worth against this fee: the amount actually PAID
+    // once it has been, otherwise the amount the admin committed and the
+    // patient is currently being asked for. Validating only against the paid
+    // figure would let a correction drop the fee below an outstanding quote,
+    // leaving a booking whose deposit exceeds its own total.
+    const paidDeposit = Number(existing.deposit_amount) || 0;
+    const deposit = paidDeposit > 0
+      ? paidDeposit
+      : Number(existing.required_deposit) || 0;
     // The deposit + discount can never exceed the base fee — that would
     // make the outstanding balance negative (patient owed money).
-    if (roundMoney(fee - DEPOSIT_AMOUNT - discount) < 0) {
+    if (roundMoney(fee - deposit - discount) < 0) {
       return res.status(400).json({
         message:
-          'The service fee must be at least the ৳100 deposit plus any discount.',
+          deposit > 0
+            ? `The service fee must be at least the ৳${deposit} deposit plus any discount.`
+            : 'The service fee must be at least the discount.',
       });
     }
     const note = typeof b.admin_note === 'string' ? b.admin_note.trim() : undefined;
@@ -468,6 +625,11 @@ router.post('/requests/:id/set-price', requireRole('admin'), async (req, res) =>
     // legacy pre-dispatch one) — the admin can correct a fee the patient
     // hasn't settled yet. Status is intentionally NOT part of the update.
     const PRICEABLE = [
+      // Correcting the fee on a booking that has been quoted but not yet paid.
+      // The DEPOSIT is untouched here — `set-deposit` owns that number, and
+      // silently moving it under a patient staring at a payment sheet is
+      // exactly what the immutable quote prevents.
+      'deposit_required',
       'deposit_paid_admin_reviewing',
       'service_completed_awaiting_final_payment',
       'amount_assigned_awaiting_final_payment',
@@ -500,33 +662,43 @@ router.post('/requests/:id/set-price', requireRole('admin'), async (req, res) =>
     const io = req.app.get('io');
     const patientId = result.patient_account_id;
     if (patientId) {
-      const outstanding = Math.max(0, roundMoney(fee - DEPOSIT_AMOUNT - discount));
-      if (invoicePayable) {
-        const title = 'Your booking fee was updated';
-        const body =
-          `Your care team updated the fee for ` +
+      const outstanding = Math.max(0, roundMoney(fee - deposit - discount));
+      // Deposit-first: the patient has been waiting on this number since
+      // they paid the deposit, so a first pricing is announced too — not
+      // just a correction to an already-payable invoice. The copy differs
+      // because the ask differs: a fresh price invites them to choose HOW
+      // they'll pay the balance; a correction asks them to settle it.
+      const title = invoicePayable
+        ? 'Your booking fee was updated'
+        : 'Your service fee is ready';
+      const body = invoicePayable
+        ? `Your care team updated the fee for ` +
           `${result.care_type || 'your booking'}. ` +
-          `Outstanding balance: ৳${outstanding}. Review & pay to settle.`;
-        const payload = {
-          appointmentId: result._id.toString(),
-          requestId: result._id.toString(),
-          deepLink: 'invoice',
-        };
-        await safeEmitNotification(io, {
-          recipientId: patientId,
-          senderId: null,
-          title,
-          body,
-          type: 'payment',
-          payload,
-        });
-        // eslint-disable-next-line no-floating-promises
-        sendHighPriorityPush(patientId, title, body, {
-          click_action: 'FLUTTER_NOTIFICATION_CLICK',
-          appointmentId: result._id.toString(),
-          deepLink: 'invoice',
-        });
-      }
+          `Outstanding balance: ৳${outstanding}. Review & pay to settle.`
+        : `Your care team set the fee for ` +
+          `${result.care_type || 'your booking'} at ৳${roundMoney(fee)}. ` +
+          (deposit > 0 ? `৳${deposit} deposit paid — ` : '') +
+          `৳${outstanding} remaining. ` +
+          `Choose to pay in cash at your visit or online.`;
+      const payload = {
+        appointmentId: result._id.toString(),
+        requestId: result._id.toString(),
+        deepLink: 'invoice',
+      };
+      await safeEmitNotification(io, {
+        recipientId: patientId,
+        senderId: null,
+        title,
+        body,
+        type: 'payment',
+        payload,
+      });
+      // eslint-disable-next-line no-floating-promises
+      sendHighPriorityPush(patientId, title, body, {
+        click_action: 'FLUTTER_NOTIFICATION_CLICK',
+        appointmentId: result._id.toString(),
+        deepLink: 'invoice',
+      });
       // Live invoice refresh fires either way so an open invoice card
       // re-renders the fee lines.
       if (io) {
@@ -544,7 +716,394 @@ router.post('/requests/:id/set-price', requireRole('admin'), async (req, res) =>
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
-});
+}
+
+router.post('/requests/:id/set-price', requireRole('admin'), setBookingPrice);
+// Deposit-first alias. Same handler, same guard — only the noun and verb
+// change, so the admin console's existing POST keeps working unchanged.
+router.patch('/bookings/:id/set-price', requireRole('admin'), setBookingPrice);
+
+// ── PHASE 2: the review call ────────────────────────────────────────────────
+//
+// PATCH /api/admin/bookings/:id/set-deposit
+//   { total_service_fee, required_deposit, adjusted_discount?, admin_note? }
+//
+// The single write that turns a free request into a payable one. The admin has
+// read the case, phoned the patient, and now commits BOTH numbers at once:
+// what the visit costs, and what the patient must deposit to confirm it.
+//
+// Committing them together is the point. `set-price` above sets a fee without
+// asking for money (a silent invoice update, used for post-review
+// corrections); this endpoint is what moves the booking to DEPOSIT_REQUIRED
+// and prompts the patient. Splitting them would let a booking sit in
+// "deposit required" with no deposit amount, which is unpayable by
+// construction.
+//
+// The backend — not the client — derives the remaining balance, so the figure
+// the patient is shown and the figure the collect-cash endpoint charges are
+// the same arithmetic:
+//   remaining_balance = total_service_fee − required_deposit − discount
+async function setBookingDeposit(req, res) {
+  try {
+    const b = req.body || {};
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: 'Invalid booking id' });
+    }
+
+    const feeRaw = Number(
+      b.total_service_fee ?? b.totalServiceFee ?? b.final_service_fee,
+    );
+    if (!Number.isFinite(feeRaw) || feeRaw <= 0) {
+      return res.status(400).json({
+        message: 'A total service fee greater than 0 is required.',
+      });
+    }
+    const depositRaw = Number(b.required_deposit ?? b.requiredDeposit);
+    if (!Number.isFinite(depositRaw) || depositRaw <= 0) {
+      return res.status(400).json({
+        message: 'A required deposit greater than 0 is required.',
+      });
+    }
+    const fee = roundMoney(feeRaw);
+    const deposit = roundMoney(depositRaw);
+    const discount = roundMoney(
+      Number(b.adjusted_discount ?? b.adjustedDiscount ?? 0) || 0,
+    );
+    if (discount < 0) {
+      return res.status(400).json({ message: 'Discount cannot be negative.' });
+    }
+    // The deposit is part of the fee, not a surcharge on top of it. Allowing
+    // deposit > fee would make the remaining balance negative — the platform
+    // owing the patient money at the end of a visit.
+    if (deposit > fee) {
+      return res.status(400).json({
+        message: 'The deposit cannot exceed the total service fee.',
+      });
+    }
+    if (roundMoney(fee - deposit - discount) < 0) {
+      return res.status(400).json({
+        message:
+          'The deposit plus the discount cannot exceed the total service fee.',
+      });
+    }
+    const note =
+      typeof b.admin_note === 'string' ? b.admin_note.trim() : undefined;
+
+    const remaining = roundMoney(fee - deposit - discount);
+    const now = new Date();
+    const update = {
+      status: 'deposit_required',
+      final_price: fee,
+      required_deposit: deposit,
+      // The immutable quote the payment endpoints validate against. Stamped
+      // here, with the commitment, so a later correction cannot re-price a
+      // checkout the patient is already standing in.
+      deposit_quoted_amount: deposit,
+      adjusted_discount: discount,
+      deposit_set_at: now,
+      deposit_set_by: req.accountId || null,
+      // A re-quote clears any earlier decline: the patient is being asked for
+      // a NEW amount, and carrying "your payment failed" onto it would be
+      // reporting a failure against a charge that never existed.
+      deposit_failed_at: null,
+      deposit_failure_reason: null,
+    };
+    if (note !== undefined) update.admin_note = note;
+
+    // Atomic compare-and-swap over the states a deposit may be set FROM:
+    // a fresh request, or one already quoted (the admin revised the amount
+    // after a second call). Deliberately NOT settable once the deposit is
+    // paid — that money is in, and moving the goalposts under a patient who
+    // already paid is a refund conversation, not an edit. Corrections after
+    // that point go through `set-price`, which leaves the deposit alone.
+    const SETTABLE = ['submitted', 'deposit_required', 'awaiting_deposit'];
+    const updated = await CareRequest.findOneAndUpdate(
+      { _id: id, status: { $in: SETTABLE } },
+      { $set: update },
+      { new: true },
+    );
+    if (!updated) {
+      const exists = await CareRequest.findById(id);
+      if (!exists) return res.status(404).json({ message: 'Booking not found' });
+      return res.status(409).json({
+        message:
+          exists.deposit_paid_at
+            ? 'This deposit has already been paid. Use set-price to correct ' +
+              'the service fee instead.'
+            : 'This booking is no longer awaiting a deposit decision.',
+        status: exists.status,
+      });
+    }
+
+    const io = req.app.get('io');
+    const patientId = updated.patient_account_id;
+    if (patientId) {
+      // The spec's Phase-3 prompt, verbatim in intent: name the amount, say
+      // what it buys. This is the first time the patient is asked for money.
+      const title = 'Deposit required to confirm your booking';
+      const body =
+        `Care team set your booking deposit to ৳${deposit}. ` +
+        `Total service fee: ৳${fee}` +
+        (discount > 0 ? ` (৳${discount} discount applied)` : '') +
+        `. Pay the deposit to confirm your visit; ৳${remaining} remains due ` +
+        'after your service.';
+      const payload = {
+        appointmentId: updated._id.toString(),
+        requestId: updated._id.toString(),
+        deepLink: 'deposit',
+      };
+      await safeEmitNotification(io, {
+        recipientId: patientId,
+        senderId: req.accountId || null,
+        title,
+        body,
+        type: 'payment',
+        payload,
+      });
+      // eslint-disable-next-line no-floating-promises
+      sendHighPriorityPush(patientId, title, body, {
+        click_action: 'FLUTTER_NOTIFICATION_CLICK',
+        ...payload,
+      });
+      if (io) {
+        // Live refresh for an open activities/invoice screen: the deposit CTA
+        // appears without the patient pulling to refresh.
+        io.to(userRoomFor(patientId)).emit('booking:deposit_required', {
+          appointmentId: updated._id.toString(),
+          bookingId: updated._id.toString(),
+          totalServiceFee: fee,
+          requiredDeposit: deposit,
+          adjustedDiscount: discount,
+          remainingBalance: remaining,
+          timestamp: now.toISOString(),
+        });
+        io.to(userRoomFor(patientId)).emit('invoice:updated', {
+          appointmentId: updated._id.toString(),
+          finalServiceFee: fee,
+          adjustedDiscount: discount,
+          outstanding: remaining,
+          timestamp: now.toISOString(),
+        });
+      }
+    }
+
+    res.json(updated.toJSON());
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+}
+
+router.patch(
+  '/bookings/:id/set-deposit',
+  requireRole('admin'),
+  setBookingDeposit,
+);
+// Same handler under the `requests` noun, matching how every other booking
+// action on this router is reachable through both vocabularies.
+router.post(
+  '/requests/:id/set-deposit',
+  requireRole('admin'),
+  setBookingDeposit,
+);
+
+// ── PHASE 4, CHANNEL B: verify an online payment & unlock the script ────────
+//
+// POST /api/admin/bookings/:id/verify-payment   { reference?, note? }
+//
+// The admin half of the dual prescription gate. The patient paid their
+// remaining balance through the gateway (bKash / Nagad / card), the booking
+// parked in PENDING_ADMIN_VERIFICATION carrying the transaction reference, and
+// an admin has now reconciled it against the payment provider. This flips the
+// booking to VERIFIED, unlocks the prescription, and tells the patient.
+//
+// Cash never reaches here — the attending clinician's confirmation already IS
+// the verification (see POST /api/clinician/bookings/:id/confirm-cash).
+async function verifyBookingPayment(req, res) {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: 'Invalid booking id' });
+    }
+    const b = req.body || {};
+    const reference =
+      typeof b.reference === 'string' && b.reference.trim()
+        ? b.reference.trim().slice(0, 200)
+        : null;
+
+    const booking = await CareRequest.findById(id);
+    if (!booking) {
+      return res.status(404).json({ message: 'Booking not found' });
+    }
+    // Verification confirms money that has ALREADY arrived. Verifying an
+    // unsettled booking would unlock a prescription nobody paid for, which is
+    // precisely what this gate exists to prevent.
+    if (!booking.final_paid_at && !booking.final_transaction_id) {
+      return res.status(409).json({
+        message:
+          'This booking has no settled balance payment to verify. The patient ' +
+          'has not paid the remaining balance yet.',
+      });
+    }
+    if (booking.remaining_payment_status === 'VERIFIED') {
+      // Idempotent: a double-tap or a stale tab re-reports success rather than
+      // re-notifying the patient that their script unlocked.
+      return res.json({
+        success: true,
+        alreadyVerified: true,
+        booking: booking.toJSON(),
+      });
+    }
+
+    const now = new Date();
+    const verifiedBy = `admin:${req.accountId}`;
+    const patch = verifiedPaymentPatch({
+      verifiedBy,
+      // Keep the gateway's own reference unless the admin recorded the one
+      // they actually reconciled against (a bKash TrxID typed off a receipt).
+      reference: reference || booking.remaining_payment_reference || null,
+    });
+    if (typeof b.note === 'string' && b.note.trim()) {
+      patch.admin_note = b.note.trim();
+    }
+
+    // Compare-and-swap on the unverified state so two admins tapping at once
+    // produce exactly one verification (and one patient notification).
+    const updated = await CareRequest.findOneAndUpdate(
+      { _id: id, remaining_payment_status: { $ne: 'VERIFIED' } },
+      { $set: patch },
+      { new: true },
+    );
+    if (!updated) {
+      const fresh = await CareRequest.findById(id);
+      return res.json({
+        success: true,
+        alreadyVerified: true,
+        booking: fresh ? fresh.toJSON() : null,
+      });
+    }
+
+    const io = req.app.get('io');
+
+    // Release every script this visit produced. Same terminal state the cash
+    // path reaches, so a patient cannot tell which channel unlocked theirs —
+    // only that it is open. A REJECTED script stays rejected: verifying a
+    // payment must never resurrect one an admin already refused.
+    await Prescription.updateMany(
+      {
+        appointment_id: updated._id,
+        admin_approval_status: { $ne: 'REJECTED' },
+      },
+      {
+        $set: {
+          payment_status: 'PAID',
+          paid_at: updated.final_paid_at || now,
+          admin_approval_status: 'APPROVED',
+          approved_by: verifiedBy,
+          approved_at: now,
+        },
+      },
+    );
+    const released = await Prescription.find({
+      appointment_id: updated._id,
+      admin_approval_status: 'APPROVED',
+    });
+    for (const script of released) {
+      if (script.patient_account_id) {
+        // An open Rx detail screen flips to UNLOCKED without a manual refresh.
+        io?.to(userRoomFor(script.patient_account_id)).emit(
+          'prescription:release_updated',
+          {
+            prescriptionId: script._id.toString(),
+            releaseStatus: releaseStateFor(script),
+            timestamp: now.toISOString(),
+          },
+        );
+      }
+    }
+
+    const patientId = updated.patient_account_id;
+    if (patientId) {
+      const title =
+        released.length > 0
+          ? 'Payment verified — prescription unlocked'
+          : 'Payment verified';
+      const body =
+        released.length > 0
+          ? 'We confirmed your online payment. Your prescription is now ' +
+            'unlocked — you can view and download it.'
+          : 'We confirmed your online payment. Your booking is fully settled.';
+      const payload = {
+        appointmentId: updated._id.toString(),
+        requestId: updated._id.toString(),
+        deepLink: 'prescriptions',
+      };
+      await safeEmitNotification(io, {
+        recipientId: patientId,
+        senderId: req.accountId || null,
+        title,
+        body,
+        type: 'payment',
+        payload,
+      });
+      // eslint-disable-next-line no-floating-promises
+      sendHighPriorityPush(patientId, title, body, {
+        click_action: 'FLUTTER_NOTIFICATION_CLICK',
+        ...payload,
+      });
+      io?.to(userRoomFor(patientId)).emit('booking:payment_verified', {
+        appointmentId: updated._id.toString(),
+        bookingId: updated._id.toString(),
+        remainingPaymentStatus: 'VERIFIED',
+        prescriptionUnlocked: true,
+        timestamp: now.toISOString(),
+      });
+    }
+
+    res.json({
+      success: true,
+      prescriptionsUnlocked: released.length,
+      booking: updated.toJSON(),
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+}
+
+router.post(
+  '/bookings/:id/verify-payment',
+  requireRole('admin'),
+  verifyBookingPayment,
+);
+router.post(
+  '/requests/:id/verify-payment',
+  requireRole('admin'),
+  verifyBookingPayment,
+);
+
+// GET /api/admin/bookings/pending-verification
+//
+// The Finance & Billing queue: every booking whose remaining balance arrived
+// online and is waiting on an admin to reconcile it. Oldest payment first —
+// the patient at the top has been locked out of their prescription longest.
+router.get(
+  '/bookings/pending-verification',
+  requireRole('admin'),
+  async (_req, res) => {
+    try {
+      const docs = await CareRequest.find({
+        remaining_payment_status: 'PENDING_ADMIN_VERIFICATION',
+      }).sort({ final_paid_at: 1 });
+      res.json({
+        success: true,
+        count: docs.length,
+        bookings: docs.map((d) => d.toJSON()),
+      });
+    } catch (err) {
+      res.status(500).json({ message: err.message });
+    }
+  },
+);
 
 // ── Prescription release gate (phase 2 of 2: admin approval) ────────────
 
@@ -690,6 +1249,166 @@ router.patch(
         prescription: presentPrescription(decided.toJSON(), decided, {
           privileged: true,
         }),
+      });
+    } catch (err) {
+      res.status(500).json({ message: err.message });
+    }
+  },
+);
+
+// PATCH /admin/requests/:id/release-prescription
+//
+// "Verify Online Payment & Release Prescription" — the booking-level twin of
+// the per-script approval above, and the ONLY release path for an online
+// payment the platform can't confirm on its own (a bank transfer, a gateway
+// callback that never landed, a manually reconciled charge).
+//
+// Why this exists separately: the Rx review queue only lists scripts that are
+// already `payment_status: 'PAID'`, so a booking whose balance was never
+// settled through the gateway can never reach it. This route does both halves
+// in one admin action — settle the booking, then release its scripts.
+//
+// Cash bookings never come through here: `collect-cash` auto-approves them
+// (see releasePrescriptionsForSettledBooking's `autoApprove`).
+router.patch(
+  '/requests/:id/release-prescription',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({ message: 'Invalid request id' });
+      }
+      const booking = await CareRequest.findById(id);
+      if (!booking) {
+        return res.status(404).json({ message: 'Request not found' });
+      }
+
+      const io = req.app.get('io');
+      const now = new Date();
+      let settled = booking;
+
+      // Half 1 — settle the balance if it is still open. Mirrors
+      // applyBalanceSettlement in routes/patient.js exactly (same field set,
+      // same wallet credit, same room emit); the transaction id is stamped
+      // ADMIN-VERIFY so reconciliation can tell a manually verified payment
+      // from a gateway one. Skipped when the booking already closed — an
+      // admin releasing a script for a booking the patient did pay online.
+      if (booking.status === 'service_completed_awaiting_final_payment') {
+        const tranId = `ADMIN-VERIFY-${booking._id.toString()}-${now.getTime()}`;
+        // CAS on the status so two admins double-tapping can't both settle.
+        const closed = await CareRequest.findOneAndUpdate(
+          { _id: id, status: 'service_completed_awaiting_final_payment' },
+          {
+            $set: {
+              status: 'completed',
+              payment_method: 'DIGITAL',
+              final_transaction_id: tranId,
+              final_paid_at: now,
+              'payment.released_at': now,
+            },
+          },
+          { new: true },
+        );
+        if (closed) {
+          settled = closed;
+          // The patient paid in full online, so the platform holds all the
+          // money: credit each provider their post-commission net share.
+          // Idempotent at the ledger level (unique index on
+          // booking+provider+type), so a retry cannot double-credit.
+          await walletService.creditVisitEarnings(io, closed, {
+            method: 'DIGITAL',
+          });
+          if (io) {
+            io.to(closed._id.toString()).emit('appointment_status_change', {
+              appointmentId: closed._id.toString(),
+              status: 'completed',
+              dbStatus: 'completed',
+              timestamp: now.toISOString(),
+            });
+          }
+        }
+      }
+
+      // Half 2 — release the scripts. Both flags in one write: an unpaid
+      // script becomes PAID *and* APPROVED, because the admin verifying the
+      // transaction IS the approval. REJECTED scripts stay rejected.
+      const releasable = await Prescription.find({
+        appointment_id: settled._id,
+        admin_approval_status: { $ne: 'REJECTED' },
+      }).select('_id admin_approval_status');
+      const pending = releasable.filter(
+        (p) => p.admin_approval_status !== 'APPROVED',
+      );
+      if (pending.length === 0) {
+        return res.status(releasable.length ? 409 : 404).json({
+          message: releasable.length
+            ? 'Every prescription on this booking is already released.'
+            : 'This booking has no prescription to release.',
+        });
+      }
+      await Prescription.updateMany(
+        { _id: { $in: pending.map((p) => p._id) } },
+        {
+          $set: {
+            payment_status: 'PAID',
+            admin_approval_status: 'APPROVED',
+            approved_by: req.accountId,
+            approved_at: now,
+            paid_at: now,
+          },
+        },
+      );
+      const released = await Prescription.find({
+        _id: { $in: pending.map((p) => p._id) },
+      });
+
+      // Patient fan-out — bell badge + OS push + live socket unlock. Same
+      // block as the per-script approval above. Best-effort: a failed
+      // notification never rolls back the release.
+      const patientId = settled.patient_account_id;
+      if (patientId) {
+        const title = 'Your prescription is unlocked';
+        const body =
+          'We verified your online payment. Your prescription is now ' +
+          'available to view and download.';
+        try {
+          await safeEmitNotification(io, {
+            recipientId: patientId,
+            senderId: req.accountId,
+            title,
+            body,
+            type: 'payment',
+            payload: {
+              requestId: settled._id.toString(),
+              deepLink: 'prescription_detail',
+            },
+          });
+        } catch (_) {
+          /* in-app fan-out failure is non-fatal */
+        }
+        // eslint-disable-next-line no-floating-promises
+        sendHighPriorityPush(patientId, title, body, {
+          click_action: 'FLUTTER_NOTIFICATION_CLICK',
+          deepLink: 'prescription_detail',
+        });
+        if (io) {
+          for (const script of released) {
+            io.to(userRoomFor(patientId)).emit('prescription:release_updated', {
+              prescriptionId: script._id.toString(),
+              releaseStatus: releaseStateFor(script),
+              timestamp: now.toISOString(),
+            });
+          }
+        }
+      }
+
+      res.json({
+        success: true,
+        appointment: await attachDoctorToRequest(settled.toJSON()),
+        prescriptions: released.map((doc) =>
+          presentPrescription(doc.toJSON(), doc, { privileged: true }),
+        ),
       });
     } catch (err) {
       res.status(500).json({ message: err.message });
@@ -911,6 +1630,19 @@ router.post('/requests/:id/assign', requireRole('admin'), async (req, res) => {
       return res.status(404).json({ message: 'Request not found' });
     }
 
+    // Phase 3 gate — the deposit must be in before anyone is dispatched.
+    if (rejectIfDepositUnpaid(res, existing)) return;
+
+    // Strict one-service-at-a-time rule. Checked server-side even though the
+    // console greys out ON_SERVICE rows: the roster the admin is looking at
+    // can be seconds stale, and this is the only place that can't be raced.
+    const busyRejected = await rejectIfProviderBusy(res, {
+      doctorId: b.doctor_id,
+      nurseId: b.nurse_id,
+      excludeRequestId: existing._id,
+    });
+    if (busyRejected) return;
+
     // Snapshot the prior assignments BEFORE mutating so we only notify a
     // provider whose id actually changed on this call — re-sending an
     // unchanged doctor id alongside a new nurse must not re-ping the
@@ -1010,7 +1742,9 @@ router.post('/requests/:id/assign', requireRole('admin'), async (req, res) => {
     await unlockBookingChannel(req.app.get('io'), result);
     // Same populated shape the patient's tracker reads, so the assigning
     // admin can confirm the provider card resolved (photo, phone, licence).
-    res.json(await attachDoctorToRequest(result.toJSON()));
+    // `attachments` rides along so the drawer that just dispatched keeps
+    // rendering the patient's documents instead of blanking on the response.
+    res.json(withAttachments(await attachDoctorToRequest(result.toJSON())));
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -1082,6 +1816,18 @@ router.post('/appointments/assign', requireRole('admin'), async (req, res) => {
       return res.status(404).json({ message: 'Appointment not found' });
     }
 
+    // Same Phase 3 deposit gate as POST /requests/:id/assign.
+    if (rejectIfDepositUnpaid(res, existing)) return;
+
+    // Same strict one-service-at-a-time rule as POST /requests/:id/assign —
+    // the two entry points must never diverge on who is dispatchable.
+    const busyRejected = await rejectIfProviderBusy(res, {
+      doctorId,
+      nurseId,
+      excludeRequestId: existing._id,
+    });
+    if (busyRejected) return;
+
     // Snapshot prior assignments before mutating — only the role whose
     // id actually changed should be notified (see notifyAssignment).
     const prevDoctorId = (existing.assigned_doctor_id || '').toString();
@@ -1150,7 +1896,7 @@ router.post('/appointments/assign', requireRole('admin'), async (req, res) => {
     );
     // Open the patient↔provider communication channel on dispatch.
     await unlockBookingChannel(req.app.get('io'), result);
-    const body = await attachDoctorToRequest(result.toJSON());
+    const body = withAttachments(await attachDoctorToRequest(result.toJSON()));
     res.json({ success: true, appointment: body });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -1591,13 +2337,10 @@ router.patch('/bookings/:id/status', requireRole('admin'), async (req, res) => {
 });
 
 // ── Real-time dispatch roster ──────────────────────────────────────────────
-// Visit lifecycle states where a provider is physically executing a visit
-// (as opposed to merely holding a future slot). A provider in one of these
-// on ANY booking is ON_SERVICE right now regardless of scheduled time.
-const ON_VISIT_STATES = ['enroute', 'on_the_way', 'arrived', 'in_service', 'nurse_completed'];
-// Every non-terminal state that occupies a provider's calendar — used to
-// build the overlap set and the active-job count.
-const OCCUPYING_STATES = ['assigned', ...ON_VISIT_STATES];
+// ON_VISIT_STATES / OCCUPYING_STATES are declared with the other assignment
+// constants at the top of this file — the roster and the assignment guard
+// must share one definition of "busy" or the UI and the API will disagree.
+//
 // ± envelope (ms) around the requested visit window within which an
 // existing booking is considered a scheduling conflict (spec: ±2 hours).
 const DISPATCH_OVERLAP_MS = 2 * 60 * 60 * 1000;
@@ -1932,6 +2675,15 @@ router.patch(
   adminController.toggleProviderVerification,
 );
 
+// PATCH /api/admin/providers/:id/status — suspend or reinstate a provider
+// account ({ status: 'active' | 'suspended' }). Independent of verification.
+// Admin-only.
+router.patch(
+  '/providers/:id/status',
+  requireRole('admin'),
+  adminController.setProviderStatus,
+);
+
 // POST /api/admin/register-sub-admin — root-admin-only creation of a
 // secondary admin account (bcrypt password, role: 'admin').
 router.post(
@@ -2012,8 +2764,19 @@ router.put('/settings', requireRole('admin'), async (req, res) => {
       }
     }
     await settings.save();
+    // The deposit is cached for 30s on the read path; drop it so an admin's
+    // edit is live on the very next request instead of up to half a minute
+    // later — the admin will immediately go and check.
+    invalidatePricingCache();
     return res.json({ success: true, settings: settings.toJSON() });
   } catch (err) {
+    // Schema-bound values (deposit 1–100000, commission 0–100, cash limit ≥ 0)
+    // are the caller's fault, not the server's. Returning 500 here surfaces as
+    // an opaque "server error" through the admin console's optimistic-update
+    // rollback, which tells the admin nothing about what they typed wrong.
+    if (err.name === 'ValidationError') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
     console.error('[admin/settings PUT] error:', err);
     return res
       .status(500)

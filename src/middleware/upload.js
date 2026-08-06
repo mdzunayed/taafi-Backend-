@@ -51,6 +51,57 @@ const upload = multer({
   },
 });
 
+// ── Patient medical documents ───────────────────────────────────────────────
+// Separate pipeline from the image uploader above: a discharge summary or an
+// old prescription is usually a PDF, and widening ALLOWED_MIME would have let
+// PDFs into every avatar/service-image endpoint too.
+const ALLOWED_DOC_MIME = new Set([...ALLOWED_MIME, 'application/pdf']);
+const ALLOWED_DOC_EXT = new Set([...ALLOWED_EXT, '.pdf']);
+
+const documentUpload = multer({
+  storage,
+  // Same 8 MB cap as the image uploader. Deliberately identical: multer's
+  // LIMIT_FILE_SIZE error carries no limit value, so uploadErrors.js can only
+  // name one number — and a message that quotes the wrong cap is worse than
+  // the slightly tighter limit.
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
+  fileFilter: (_req, file, cb) => {
+    const mime = String(file.mimetype || '').toLowerCase();
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (!ALLOWED_DOC_MIME.has(mime) || !ALLOWED_DOC_EXT.has(ext)) {
+      const err = new Error('Only PDF, JPEG, PNG, and WEBP files are allowed.');
+      err.code = 'ONLY_ALLOWED_DOCUMENTS';
+      return cb(err, false);
+    }
+    cb(null, true);
+  },
+});
+
+function writeDocumentToDisk(buffer, publicId, ext) {
+  const filename = `${publicId}${ext}`;
+  const fullPath = path.join(UPLOAD_DIR, filename);
+  // Document public ids are namespaced (`patient-docs/<account>-<ts>`), so the
+  // target sits in a SUBDIRECTORY of UPLOAD_DIR that nothing has created yet —
+  // writeFileSync does not make parents, and without this every disk-fallback
+  // upload fails with ENOENT.
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  fs.writeFileSync(fullPath, buffer);
+  return filename;
+}
+
+/// Store a patient document and return the value to persist: a full
+/// Cloudinary https URL, or a bare filename served off the /uploads mount in
+/// local dev (same two shapes as [storeImage]).
+async function storeDocument(buffer, publicId, { mime, ext }) {
+  const isPdf = String(mime || '').toLowerCase() === 'application/pdf';
+  if (cloudinary.isEnabled()) {
+    // PDFs go through the `raw` pipeline; images keep the image pipeline so
+    // Cloudinary's transformations/CDN still apply to them.
+    return cloudinary.uploadBuffer(buffer, publicId, isPdf ? 'raw' : 'image');
+  }
+  return writeDocumentToDisk(buffer, publicId, ext || '');
+}
+
 function writeImageToDisk(buffer, serviceId) {
   const filename = `${serviceId}.jpg`;
   const fullPath = path.join(UPLOAD_DIR, filename);
@@ -88,9 +139,11 @@ async function removeImage(publicId) {
 
 module.exports = {
   upload,
+  documentUpload,
   writeImageToDisk,
   deleteImageFromDisk,
   storeImage,
+  storeDocument,
   removeImage,
   UPLOAD_DIR,
 };
